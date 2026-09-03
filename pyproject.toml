@@ -9,6 +9,8 @@ description = "MDoNER Service A memory assistance calling companion"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115,<1.0",
+    "python-multipart>=0.0.20,<1.0",
+    "twilio>=9.0,<10.0",
     "uvicorn[standard]>=0.34,<1.0",
 ]
 
