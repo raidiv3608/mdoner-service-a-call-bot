@@ -22,6 +22,10 @@ class MockTelephonyAdapter(TelephonyAdapter):
             "Take your time, and I will be here to help."
         )
 
+    def start_outbound_call(self, to_phone_number: str, voice_url: str) -> str:
+        self.start_call()
+        return "MOCK-CALL-SID"
+
     def start_call(self) -> None:
         self.call_started = True
         self.transcript.append("START_CALL")

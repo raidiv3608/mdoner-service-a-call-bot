@@ -19,3 +19,7 @@ class TelephonyAdapter(ABC):
     @abstractmethod
     def greeting_response(self) -> str:
         """Return the provider-specific response for the call greeting."""
+
+    @abstractmethod
+    def start_outbound_call(self, to_phone_number: str, voice_url: str) -> str:
+        """Start an outbound call and return the provider call identifier."""

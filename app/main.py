@@ -8,7 +8,12 @@ from app.telephony.twilio import TwilioAdapter
 
 
 app = FastAPI(title=settings.app_name)
-twilio_adapter = TwilioAdapter(settings.twilio_auth_token)
+TWILIO_VOICE_START_PATH = "/webhooks/twilio/voice/start"
+twilio_adapter = TwilioAdapter(
+    account_sid=settings.twilio_account_sid,
+    auth_token=settings.twilio_auth_token,
+    from_phone_number=settings.twilio_from_phone_number,
+)
 
 
 @app.get("/health")
@@ -25,7 +30,12 @@ async def twilio_voice_start(request: Request) -> Response:
     form = await request.form()
     params = {key: str(value) for key, value in form.items()}
     signature = request.headers.get("X-Twilio-Signature")
-    if not twilio_adapter.validate_webhook(str(request.url), params, signature):
+    webhook_url = (
+        f"{settings.twilio_public_base_url.rstrip('/')}{TWILIO_VOICE_START_PATH}"
+        if settings.twilio_public_base_url
+        else str(request.url)
+    )
+    if not twilio_adapter.validate_webhook(webhook_url, params, signature):
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
     return Response(content=twilio_adapter.greeting_response(), media_type="application/xml")

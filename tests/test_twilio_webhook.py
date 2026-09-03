@@ -1,12 +1,18 @@
+from dataclasses import replace
+import importlib
+
 from fastapi.testclient import TestClient
 from twilio.request_validator import RequestValidator
 
 from app.main import app
+from app.telephony.twilio import TwilioAdapter
 
 
+main_module = importlib.import_module("app.main")
 client = TestClient(app)
 AUTH_TOKEN = "test-auth-token"
-WEBHOOK_URL = "http://testserver/webhooks/twilio/voice/start"
+WEBHOOK_PATH = "/webhooks/twilio/voice/start"
+WEBHOOK_URL = f"http://testserver{WEBHOOK_PATH}"
 
 
 def signed_headers(params: dict[str, str]) -> dict[str, str]:
@@ -15,9 +21,7 @@ def signed_headers(params: dict[str, str]) -> dict[str, str]:
 
 
 def test_voice_start_returns_greeting_twiml(monkeypatch) -> None:
-    monkeypatch.setattr("app.main.twilio_adapter", __import__(
-        "app.telephony.twilio", fromlist=["TwilioAdapter"]
-    ).TwilioAdapter(AUTH_TOKEN))
+    monkeypatch.setattr(main_module, "twilio_adapter", TwilioAdapter(auth_token=AUTH_TOKEN))
     params = {"CallSid": "CA123", "From": "+15550000000"}
 
     response = client.post(
@@ -30,6 +34,27 @@ def test_voice_start_returns_greeting_twiml(monkeypatch) -> None:
     assert response.headers["content-type"] == "application/xml"
     assert "<Say" in response.text
     assert "memory assistance companion" in response.text
+
+
+def test_voice_start_validates_signature_using_public_base_url(monkeypatch) -> None:
+    public_base_url = "https://service.example.com"
+    public_webhook_url = f"{public_base_url}{WEBHOOK_PATH}"
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        replace(main_module.settings, twilio_public_base_url=public_base_url),
+    )
+    monkeypatch.setattr(main_module, "twilio_adapter", TwilioAdapter(auth_token=AUTH_TOKEN))
+    params = {"CallSid": "CA456"}
+    signature = RequestValidator(AUTH_TOKEN).compute_signature(public_webhook_url, params)
+
+    response = client.post(
+        WEBHOOK_PATH,
+        data=params,
+        headers={"X-Twilio-Signature": signature},
+    )
+
+    assert response.status_code == 200
 
 
 def test_voice_start_rejects_missing_signature() -> None:
