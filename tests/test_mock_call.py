@@ -1,10 +1,16 @@
-from app.mock_call import AnswerClassification, run_mock_call
+from app.mock_call import (
+    AnswerClassification,
+    ReadinessOutcome,
+    classify_readiness,
+    run_mock_call,
+)
 
 
 def test_normal_successful_call() -> None:
-    result = run_mock_call(["yes", "alex", "january", "london", "toast", "music"])
+    result = run_mock_call(["yes", "monday", "january", "london", "toast", "music"])
 
     assert result.status == "COMPLETED"
+    assert result.readiness is ReadinessOutcome.READY
     assert result.questions_completed == 5
     assert result.classifications == (
         AnswerClassification.CORRECT,
@@ -63,7 +69,29 @@ def test_repeated_no_input_is_skipped_and_call_continues() -> None:
 
 
 def test_successful_completion_has_normal_closing() -> None:
-    result = run_mock_call(["ready", "alex", "january", "london", "toast", "music"])
+    result = run_mock_call(["ready", "monday", "january", "london", "toast", "music"])
 
     assert result.status == "COMPLETED"
     assert result.transcript[-1].startswith("BOT: You have completed all five questions.")
+
+
+def test_orientation_question_is_first_and_uses_day_fixture() -> None:
+    result = run_mock_call(["yes", "monday", "january", "london", "toast", "music"])
+
+    assert "BOT: What day is it today?" in result.transcript
+    assert result.classifications[0] is AnswerClassification.CORRECT
+
+
+def test_readiness_outcomes_are_explicit() -> None:
+    assert classify_readiness("yes") is ReadinessOutcome.READY
+    assert classify_readiness("no") is ReadinessOutcome.NOT_READY
+    assert classify_readiness("stop") is ReadinessOutcome.STOP
+    assert classify_readiness("maybe") is ReadinessOutcome.UNKNOWN
+    assert classify_readiness(None) is ReadinessOutcome.NO_INPUT
+
+
+def test_readiness_no_input_retries_once() -> None:
+    result = run_mock_call([None, "ready", "monday", "january", "london", "toast", "music"])
+
+    assert result.status == "COMPLETED"
+    assert result.readiness is ReadinessOutcome.READY

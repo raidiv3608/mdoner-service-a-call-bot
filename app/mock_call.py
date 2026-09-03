@@ -14,6 +14,14 @@ class AnswerClassification(str, Enum):
     SKIPPED = "SKIPPED"
 
 
+class ReadinessOutcome(str, Enum):
+    READY = "READY"
+    NOT_READY = "NOT_READY"
+    STOP = "STOP"
+    UNKNOWN = "UNKNOWN"
+    NO_INPUT = "NO_INPUT"
+
+
 @dataclass(frozen=True)
 class MockQuestion:
     prompt: str
@@ -22,7 +30,7 @@ class MockQuestion:
 
 
 QUESTIONS = (
-    MockQuestion("What is your first name?", ("alex",), 1),
+    MockQuestion("What day is it today?", ("monday",), 1),
     MockQuestion("What month is it?", ("january",), 2),
     MockQuestion("What city are you in?", ("london",), 3),
     MockQuestion("What did you have for breakfast?", ("toast",), 2),
@@ -33,6 +41,7 @@ QUESTIONS = (
 @dataclass(frozen=True)
 class MockCallResult:
     status: str
+    readiness: ReadinessOutcome
     classifications: tuple[AnswerClassification, ...]
     questions_completed: int
     consecutive_incorrect: int
@@ -54,6 +63,21 @@ def classify_answer(answer: str | None, question: MockQuestion) -> AnswerClassif
     return AnswerClassification.INCORRECT
 
 
+def classify_readiness(answer: str | None) -> ReadinessOutcome:
+    """Classify the patient's deterministic readiness response."""
+
+    normalized = (answer or "").strip().lower()
+    if normalized in {"stop", "quit", "end call"}:
+        return ReadinessOutcome.STOP
+    if not normalized:
+        return ReadinessOutcome.NO_INPUT
+    if normalized in {"yes", "ready"}:
+        return ReadinessOutcome.READY
+    if normalized in {"no", "not ready", "later"}:
+        return ReadinessOutcome.NOT_READY
+    return ReadinessOutcome.UNKNOWN
+
+
 def run_mock_call(
     responses: list[str | None],
     questions: tuple[MockQuestion, ...] = QUESTIONS,
@@ -66,9 +90,20 @@ def run_mock_call(
     adapter.speak(adapter.greeting_response())
     adapter.speak("Are you ready to begin? Please say yes or no.")
     readiness = adapter.listen()
-    if (readiness or "").strip().lower() not in {"yes", "ready"}:
+    readiness_outcome = classify_readiness(readiness)
+    if readiness_outcome in {ReadinessOutcome.UNKNOWN, ReadinessOutcome.NO_INPUT}:
+        adapter.speak("I did not catch that. Please say ready or not ready.")
+        readiness_outcome = classify_readiness(adapter.listen())
+    if readiness_outcome is not ReadinessOutcome.READY:
         adapter.speak("That is okay. We can try again another time. Goodbye.")
-        return MockCallResult("STOPPED", tuple(), 0, 0, tuple(adapter.transcript))
+        return MockCallResult(
+            "STOPPED",
+            readiness_outcome,
+            tuple(),
+            0,
+            0,
+            tuple(adapter.transcript),
+        )
 
     adapter.speak("Thank you. We will take this one question at a time.")
     question_order = list(range(len(questions)))
@@ -86,7 +121,7 @@ def run_mock_call(
         if classification is AnswerClassification.STOP:
             classifications.append(classification)
             adapter.speak("Understood. Thank you for your time. Goodbye.")
-            return MockCallResult("STOPPED", tuple(classifications), completed, consecutive_incorrect, tuple(adapter.transcript))
+            return MockCallResult("STOPPED", readiness_outcome, tuple(classifications), completed, consecutive_incorrect, tuple(adapter.transcript))
         if classification is AnswerClassification.UNSCORABLE:
             classifications.append(classification)
             if not no_input_repeated:
@@ -116,7 +151,7 @@ def run_mock_call(
         consecutive_incorrect += 1
         if consecutive_incorrect >= 3:
             adapter.speak("It seems like this is not a good time. We will end the call now. Goodbye.")
-            return MockCallResult("STOPPED", tuple(classifications), completed, consecutive_incorrect, tuple(adapter.transcript))
+            return MockCallResult("STOPPED", readiness_outcome, tuple(classifications), completed, consecutive_incorrect, tuple(adapter.transcript))
         if consecutive_incorrect == 2:
             adapter.speak("That is okay. I will make the next question a little easier.")
             remaining = question_order[question_position + 1 :]
@@ -125,4 +160,4 @@ def run_mock_call(
         question_position += 1
 
     adapter.speak("You have completed all five questions. Thank you for taking part. Goodbye.")
-    return MockCallResult("COMPLETED", tuple(classifications), completed, consecutive_incorrect, tuple(adapter.transcript))
+    return MockCallResult("COMPLETED", readiness_outcome, tuple(classifications), completed, consecutive_incorrect, tuple(adapter.transcript))
