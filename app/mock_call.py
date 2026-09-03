@@ -1,0 +1,128 @@
+"""Deterministic local call flow for Service A."""
+
+from dataclasses import dataclass
+from enum import Enum
+
+from app.telephony.mock import MockTelephonyAdapter
+
+
+class AnswerClassification(str, Enum):
+    CORRECT = "CORRECT"
+    INCORRECT = "INCORRECT"
+    UNSCORABLE = "UNSCORABLE"
+    STOP = "STOP"
+    SKIPPED = "SKIPPED"
+
+
+@dataclass(frozen=True)
+class MockQuestion:
+    prompt: str
+    accepted_answers: tuple[str, ...]
+    difficulty: int
+
+
+QUESTIONS = (
+    MockQuestion("What is your first name?", ("alex",), 1),
+    MockQuestion("What month is it?", ("january",), 2),
+    MockQuestion("What city are you in?", ("london",), 3),
+    MockQuestion("What did you have for breakfast?", ("toast",), 2),
+    MockQuestion("What is one thing you enjoy?", ("music",), 1),
+)
+
+
+@dataclass(frozen=True)
+class MockCallResult:
+    status: str
+    classifications: tuple[AnswerClassification, ...]
+    questions_completed: int
+    consecutive_incorrect: int
+    transcript: tuple[str, ...]
+
+
+def classify_answer(answer: str | None, question: MockQuestion) -> AnswerClassification:
+    """Classify fixture answers with exact, normalized matching."""
+
+    normalized = (answer or "").strip().lower()
+    if normalized in {"stop", "quit", "end call"}:
+        return AnswerClassification.STOP
+    if normalized in {"skip", "skipped"}:
+        return AnswerClassification.SKIPPED
+    if not normalized or normalized in {"unclear", "i don't know", "unknown"}:
+        return AnswerClassification.UNSCORABLE
+    if normalized in question.accepted_answers:
+        return AnswerClassification.CORRECT
+    return AnswerClassification.INCORRECT
+
+
+def run_mock_call(
+    responses: list[str | None],
+    questions: tuple[MockQuestion, ...] = QUESTIONS,
+) -> MockCallResult:
+    """Run one complete deterministic mock call and return its session result."""
+
+    adapter = MockTelephonyAdapter(responses)
+    classifications: list[AnswerClassification] = []
+    adapter.start_call()
+    adapter.speak(adapter.greeting_response())
+    adapter.speak("Are you ready to begin? Please say yes or no.")
+    readiness = adapter.listen()
+    if (readiness or "").strip().lower() not in {"yes", "ready"}:
+        adapter.speak("That is okay. We can try again another time. Goodbye.")
+        return MockCallResult("STOPPED", tuple(), 0, 0, tuple(adapter.transcript))
+
+    adapter.speak("Thank you. We will take this one question at a time.")
+    question_order = list(range(len(questions)))
+    question_position = 0
+    completed = 0
+    consecutive_incorrect = 0
+    no_input_repeated = False
+
+    while question_position < len(question_order):
+        question_index = question_order[question_position]
+        question = questions[question_index]
+        adapter.speak(question.prompt)
+        classification = classify_answer(adapter.listen(), question)
+
+        if classification is AnswerClassification.STOP:
+            classifications.append(classification)
+            adapter.speak("Understood. Thank you for your time. Goodbye.")
+            return MockCallResult("STOPPED", tuple(classifications), completed, consecutive_incorrect, tuple(adapter.transcript))
+        if classification is AnswerClassification.UNSCORABLE:
+            classifications.append(classification)
+            if not no_input_repeated:
+                no_input_repeated = True
+                adapter.speak("I did not catch that. Please take your time and try once more.")
+                continue
+            classifications.append(AnswerClassification.SKIPPED)
+            adapter.speak("That is okay. We will move to the next question.")
+            question_position += 1
+            no_input_repeated = False
+            continue
+        if classification is AnswerClassification.SKIPPED:
+            classifications.append(classification)
+            adapter.speak("That is okay. We will move to the next question.")
+            question_position += 1
+            no_input_repeated = False
+            continue
+
+        classifications.append(classification)
+        no_input_repeated = False
+        if classification is AnswerClassification.CORRECT:
+            completed += 1
+            consecutive_incorrect = 0
+            question_position += 1
+            continue
+
+        consecutive_incorrect += 1
+        if consecutive_incorrect >= 3:
+            adapter.speak("It seems like this is not a good time. We will end the call now. Goodbye.")
+            return MockCallResult("STOPPED", tuple(classifications), completed, consecutive_incorrect, tuple(adapter.transcript))
+        if consecutive_incorrect == 2:
+            adapter.speak("That is okay. I will make the next question a little easier.")
+            remaining = question_order[question_position + 1 :]
+            remaining.sort(key=lambda index: questions[index].difficulty)
+            question_order[question_position + 1 :] = remaining
+        question_position += 1
+
+    adapter.speak("You have completed all five questions. Thank you for taking part. Goodbye.")
+    return MockCallResult("COMPLETED", tuple(classifications), completed, consecutive_incorrect, tuple(adapter.transcript))
