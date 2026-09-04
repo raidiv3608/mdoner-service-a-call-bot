@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from twilio.request_validator import RequestValidator
 
 from app.main import app
+from app.persistence import LocalCallStore
 from app.telephony.twilio import TwilioAdapter
 
 
@@ -136,6 +137,37 @@ def test_provider_failure_returns_safe_error(monkeypatch) -> None:
     )
 
     assert response.status_code == 502
+
+
+def test_provider_failure_persists_failed_session(monkeypatch, tmp_path) -> None:
+    adapter = TwilioAdapter(auth_token=AUTH_TOKEN)
+
+    def fail_greeting() -> str:
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(adapter, "greeting_response", fail_greeting)
+    monkeypatch.setattr(main_module, "twilio_adapter", adapter)
+    database_path = tmp_path / "failed.sqlite3"
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        replace(main_module.settings, local_database_path=str(database_path)),
+    )
+    params = {"CallSid": "CA_PROVIDER_FAILURE_PERSISTED"}
+
+    response = client.post(
+        WEBHOOK_PATH,
+        data=params,
+        headers=signed_headers(params),
+    )
+
+    assert response.status_code == 502
+    store = LocalCallStore(str(database_path))
+    session = store.connection.execute(
+        "SELECT status, termination_reason FROM cognitive_sessions WHERE session_id = ?",
+        (params["CallSid"],),
+    ).fetchone()
+    assert tuple(session) == ("FAILED", "PROVIDER_FAILURE")
 
 
 def test_trigger_outbound_call_returns_call_sid(monkeypatch) -> None:

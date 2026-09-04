@@ -361,7 +361,7 @@ class LocalCallStore:
                 attempt.classification.value == "UNSCORABLE"
                 for attempt in result.question_attempts
             ),
-            review_classification="REVIEW" if result.status == "STOPPED" else "NONE",
+            review_classification="REVIEW" if result.status == "EARLY_TERMINATED" else "NONE",
             metadata_json=json.dumps(
                 {
                     "readiness": result.readiness.value,
@@ -477,10 +477,14 @@ def create_local_repository(database_path: str = ":memory:") -> CallPersistenceR
 def _termination_reason(result: MockCallResult) -> str:
     if result.status == "COMPLETED":
         return "COMPLETED"
+    if result.status == "RESCHEDULED":
+        return "NOT_READY"
+    if result.status == "FAILED":
+        return "PROVIDER_FAILURE"
     if result.readiness.value != "READY":
-        return f"READINESS_{result.readiness.value}"
+        return "NOT_READY"
     if result.classifications and result.classifications[-1].value == "STOP":
         return "PATIENT_STOP"
     if result.consecutive_incorrect >= 3:
-        return "THREE_CONSECUTIVE_INCORRECT"
-    return "CALL_STOPPED"
+        return "CONSECUTIVE_INCORRECT"
+    return "EARLY_TERMINATED"

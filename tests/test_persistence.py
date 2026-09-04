@@ -161,10 +161,24 @@ def test_early_termination_is_persisted() -> None:
     )
 
     session = result.persisted_call.session
-    assert session.status == "STOPPED"
-    assert session.termination_reason == "THREE_CONSECUTIVE_INCORRECT"
+    assert session.status == "EARLY_TERMINATED"
+    assert session.termination_reason == "CONSECUTIVE_INCORRECT"
     assert store.count("cognitive_sessions") == 1
     assert store.count("call_questions") == 3
+
+
+def test_patient_stop_persists_early_termination_reason() -> None:
+    _, result = run_with_store(["yes", "stop"], "session-patient-stop")
+
+    assert result.persisted_call.session.status == "EARLY_TERMINATED"
+    assert result.persisted_call.session.termination_reason == "PATIENT_STOP"
+
+
+def test_not_ready_persists_rescheduled_status() -> None:
+    _, result = run_with_store(["no"], "session-rescheduled")
+
+    assert result.persisted_call.session.status == "RESCHEDULED"
+    assert result.persisted_call.session.termination_reason == "NOT_READY"
 
 
 def test_session_aggregation_is_deterministic() -> None:

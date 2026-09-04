@@ -37,7 +37,7 @@ def test_incorrect_answer_continues() -> None:
 def test_unscorable_answer_repeats_once_then_terminates() -> None:
     result = run_mock_call(["yes", "unclear", "", "january", "london", "toast", "music"])
 
-    assert result.status == "STOPPED"
+    assert result.status == "EARLY_TERMINATED"
     assert result.classifications == (
         AnswerClassification.UNSCORABLE,
         AnswerClassification.UNSCORABLE,
@@ -47,7 +47,7 @@ def test_unscorable_answer_repeats_once_then_terminates() -> None:
 def test_stop_ends_immediately() -> None:
     result = run_mock_call(["yes", "stop"])
 
-    assert result.status == "STOPPED"
+    assert result.status == "EARLY_TERMINATED"
     assert result.classifications == (AnswerClassification.STOP,)
     assert "Goodbye." in result.transcript[-1]
 
@@ -55,8 +55,8 @@ def test_stop_ends_immediately() -> None:
 def test_three_consecutive_incorrect_answers_end_call() -> None:
     result = run_mock_call(["yes", "wrong", "wrong", "wrong"])
 
-    assert result.status == "STOPPED"
-    assert result.state is ConversationState.STOPPED
+    assert result.status == "EARLY_TERMINATED"
+    assert result.state is ConversationState.EARLY_TERMINATED
     assert result.consecutive_incorrect == 3
     assert result.classifications == (
         AnswerClassification.INCORRECT,
@@ -68,7 +68,7 @@ def test_three_consecutive_incorrect_answers_end_call() -> None:
 def test_repeated_no_input_terminates_safely() -> None:
     result = run_mock_call(["yes", None, None, "january", "london", "toast", "music"])
 
-    assert result.status == "STOPPED"
+    assert result.status == "EARLY_TERMINATED"
     assert result.classifications == (
         AnswerClassification.UNSCORABLE,
         AnswerClassification.UNSCORABLE,
@@ -104,6 +104,13 @@ def test_readiness_no_input_retries_once() -> None:
 
     assert result.status == "COMPLETED"
     assert result.readiness is ReadinessOutcome.READY
+
+
+def test_not_ready_reschedules_call() -> None:
+    result = run_mock_call(["no"])
+
+    assert result.status == "RESCHEDULED"
+    assert result.state is ConversationState.RESCHEDULED
 
 
 def test_two_consecutive_incorrect_answers_select_an_easier_remaining_question() -> None:

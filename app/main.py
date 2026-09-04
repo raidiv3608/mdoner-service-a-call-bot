@@ -126,7 +126,7 @@ def _response_for_turn(
     event_key: str,
 ) -> Response:
     try:
-        if engine.state is ConversationState.QUESTIONS:
+        if engine.state is ConversationState.QUESTIONING:
             response_body = twilio_adapter.gather_response(
                 turn_messages,
                 _public_url(request, TWILIO_ANSWER_PATH, engine.revision),
@@ -138,6 +138,11 @@ def _response_for_turn(
     except PersistenceError as error:
         raise HTTPException(status_code=503, detail="Conversation finalization unavailable") from error
     except Exception as error:
+        engine.fail()
+        try:
+            repository.persist_call(engine.build_result(()), patient_id="local-patient")
+        except PersistenceError:
+            pass
         raise HTTPException(status_code=502, detail="Telephony provider unavailable") from error
     _save_turn(repository, engine, event_key, response_body)
     return Response(content=response_body, media_type="application/xml")
@@ -166,6 +171,11 @@ async def twilio_voice_start(request: Request) -> Response:
             _public_url(request, TWILIO_READINESS_PATH, engine.revision),
         )
     except Exception as error:
+        engine.fail()
+        try:
+            repository.persist_call(engine.build_result(()), patient_id="local-patient")
+        except PersistenceError:
+            pass
         raise HTTPException(status_code=502, detail="Telephony provider unavailable") from error
     _save_turn(repository, engine, event_key, response_body)
     return Response(content=response_body, media_type="application/xml")

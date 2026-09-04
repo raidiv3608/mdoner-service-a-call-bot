@@ -30,11 +30,14 @@ class ReadinessOutcome(str, Enum):
 
 
 class ConversationState(str, Enum):
-    GREETING = "GREETING"
+    SCHEDULED = "SCHEDULED"
+    DIALING = "DIALING"
     READINESS = "READINESS"
-    QUESTIONS = "QUESTIONS"
+    QUESTIONING = "QUESTIONING"
     COMPLETED = "COMPLETED"
-    STOPPED = "STOPPED"
+    EARLY_TERMINATED = "EARLY_TERMINATED"
+    RESCHEDULED = "RESCHEDULED"
+    FAILED = "FAILED"
 
 
 @dataclass(frozen=True)
@@ -101,7 +104,7 @@ class ConversationTurn:
 
 @dataclass
 class _ConversationProgress:
-    state: ConversationState = ConversationState.GREETING
+    state: ConversationState = ConversationState.SCHEDULED
     question_position: int = 0
     questions_completed: int = 0
     consecutive_incorrect: int = 0
@@ -162,6 +165,7 @@ class ConversationEngine:
         return self.question_set[self.question_order[self.progress.question_position]]
 
     def start(self) -> ConversationTurn:
+        self.progress.state = ConversationState.DIALING
         self.progress.state = ConversationState.READINESS
         self.revision += 1
         return ConversationTurn(("Are you ready to begin? Please say yes or no.",))
@@ -173,10 +177,10 @@ class ConversationEngine:
         if self.readiness in {ReadinessOutcome.UNKNOWN, ReadinessOutcome.NO_INPUT}:
             if self.readiness_attempts == 1:
                 return ConversationTurn(("I did not catch that. Please say ready or not ready.",))
-            return self._stop(("That is okay. We can try again another time. Goodbye.",))
+            return self._reschedule(("That is okay. We can try again another time. Goodbye.",))
         if self.readiness is not ReadinessOutcome.READY:
-            return self._stop(("That is okay. We can try again another time. Goodbye.",))
-        self.progress.state = ConversationState.QUESTIONS
+            return self._reschedule(("That is okay. We can try again another time. Goodbye.",))
+        self.progress.state = ConversationState.QUESTIONING
         return ConversationTurn(
             (
                 "Thank you. We will take this one question at a time.",
@@ -190,7 +194,7 @@ class ConversationEngine:
     ) -> ConversationTurn:
         self.revision += 1
         question = self.current_question
-        if self.progress.state is not ConversationState.QUESTIONS or question is None:
+        if self.progress.state is not ConversationState.QUESTIONING or question is None:
             return ConversationTurn(())
         if isinstance(answer, MockSpeechResult):
             response = answer.text
@@ -260,7 +264,7 @@ class ConversationEngine:
         return self._next_question((message,), classification)
 
     def build_result(self, transcript: tuple[str, ...]) -> MockCallResult:
-        status = "COMPLETED" if self.state is ConversationState.COMPLETED else "STOPPED"
+        status = self.state.value
         return MockCallResult(
             status=status,
             state=self.state,
@@ -273,6 +277,9 @@ class ConversationEngine:
             question_attempts=tuple(self.question_attempts),
             planned_question_count=len(self.question_set),
         )
+
+    def fail(self) -> None:
+        self.progress.state = ConversationState.FAILED
 
     def to_state(self) -> dict[str, object]:
         """Return JSON-compatible state for server-side conversation storage."""
@@ -402,8 +409,12 @@ class ConversationEngine:
         messages: tuple[str, ...],
         classification: AnswerClassification | None = None,
     ) -> ConversationTurn:
-        self.progress.state = ConversationState.STOPPED
+        self.progress.state = ConversationState.EARLY_TERMINATED
         return ConversationTurn(messages, classification)
+
+    def _reschedule(self, messages: tuple[str, ...]) -> ConversationTurn:
+        self.progress.state = ConversationState.RESCHEDULED
+        return ConversationTurn(messages)
 
 
 def classify_answer(
@@ -498,7 +509,7 @@ def run_mock_call(
         readiness = adapter.listen()
         for message in engine.submit_readiness(readiness).messages:
             adapter.speak(message)
-    while engine.state is ConversationState.QUESTIONS:
+    while engine.state is ConversationState.QUESTIONING:
         answer = adapter.listen()
         turn = engine.submit_answer(answer)
         for message in turn.messages:
