@@ -89,6 +89,7 @@ class MockCallResult:
     transcript: tuple[str, ...]
     session_id: str
     question_attempts: tuple[MockQuestionAttempt, ...]
+    planned_question_count: int
     persisted_call: PersistedCall | None = None
 
 
@@ -261,15 +262,16 @@ class ConversationEngine:
     def build_result(self, transcript: tuple[str, ...]) -> MockCallResult:
         status = "COMPLETED" if self.state is ConversationState.COMPLETED else "STOPPED"
         return MockCallResult(
-            status,
-            self.state,
-            self.readiness,
-            tuple(self.classifications),
-            self.progress.questions_completed,
-            self.progress.consecutive_incorrect,
-            transcript,
-            self.session_id,
-            tuple(self.question_attempts),
+            status=status,
+            state=self.state,
+            readiness=self.readiness,
+            classifications=tuple(self.classifications),
+            questions_completed=self.progress.questions_completed,
+            consecutive_incorrect=self.progress.consecutive_incorrect,
+            transcript=transcript,
+            session_id=self.session_id,
+            question_attempts=tuple(self.question_attempts),
+            planned_question_count=len(self.question_set),
         )
 
     def to_state(self) -> dict[str, object]:
@@ -387,7 +389,10 @@ class ConversationEngine:
             self.progress.state = ConversationState.COMPLETED
             return ConversationTurn(
                 messages
-                + ("You have completed all five questions. Thank you for taking part. Goodbye.",),
+                + (
+                    f"You have completed all {len(self.question_set)} questions. "
+                    "Thank you for taking part. Goodbye.",
+                ),
                 classification,
             )
         return ConversationTurn(messages + (question.prompt,), classification)

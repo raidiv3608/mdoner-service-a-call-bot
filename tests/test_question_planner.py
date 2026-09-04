@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from app.mock_call import AnswerClassification, run_mock_call
 from app.persistence import LocalCallStore
 from app.question_planner import (
@@ -124,3 +126,35 @@ def test_planned_alias_is_evaluated_as_correct() -> None:
         if question.memory_id == memory.memory_id
     )
     assert result.classifications[memory_index] is AnswerClassification.CORRECT
+
+
+@pytest.mark.parametrize("question_count", [5, 6, 7, 8])
+def test_execution_and_aggregates_match_each_plan_length(question_count: int) -> None:
+    planner = QuestionPlanner(
+        LocalFamilyMemoryRepository(memories(max(0, question_count - 5)))
+    )
+    plan = planner.plan("patient-1", seed=question_count)
+    responses = ["yes", "wrong"] + [
+        question.accepted_answers[0] for question in plan.questions[1:]
+    ]
+    store = LocalCallStore()
+
+    result = run_mock_call(
+        responses,
+        store=store,
+        patient_id="patient-1",
+        session_id=f"plan-{question_count}",
+        planner=planner,
+        plan_seed=question_count,
+    )
+
+    assert result.status == "COMPLETED"
+    assert result.planned_question_count == question_count
+    assert len(result.question_attempts) == question_count
+    assert f"You have completed all {question_count} questions." in result.transcript[-1]
+    assert result.persisted_call.session.session_score == pytest.approx(
+        (question_count - 1) / question_count
+    )
+    assert result.persisted_call.session.summary_accuracy == pytest.approx(
+        (question_count - 1) / question_count
+    )

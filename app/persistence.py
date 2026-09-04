@@ -340,7 +340,7 @@ class LocalCallStore:
         )
         summary_accuracy = correct_count / len(scored) if scored else None
         session_score = (
-            result.questions_completed / 5
+            result.questions_completed / result.planned_question_count
             if result.readiness.value == "READY"
             else None
         )

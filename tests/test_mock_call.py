@@ -81,7 +81,7 @@ def test_successful_completion_has_normal_closing() -> None:
     result = run_mock_call(["ready", "monday", "january", "london", "toast", "music"])
 
     assert result.status == "COMPLETED"
-    assert result.transcript[-1].startswith("BOT: You have completed all five questions.")
+    assert result.transcript[-1].startswith("BOT: You have completed all 5 questions.")
 
 
 def test_orientation_question_is_first_and_uses_day_fixture() -> None:
