@@ -3,8 +3,12 @@
 import json
 import hashlib
 import hmac
+import logging
+import time
+from collections import defaultdict, deque
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
@@ -15,8 +19,28 @@ from app.persistence import ConversationRecord, LocalCallStore, PersistenceError
 from app.question_planner import QuestionPlanner
 from app.telephony.twilio import TwilioAdapter
 
+logger = logging.getLogger("app.main")
 
 app = FastAPI(title=settings.app_name)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    return response
+
+
 TWILIO_VOICE_START_PATH = "/webhooks/twilio/voice/start"
 TWILIO_READINESS_PATH = "/webhooks/twilio/voice/readiness"
 TWILIO_ANSWER_PATH = "/webhooks/twilio/voice/answer"
@@ -33,6 +57,32 @@ twilio_adapter = TwilioAdapter(
     from_phone_number=settings.twilio_from_phone_number,
 )
 question_planner = QuestionPlanner()
+
+
+class CallTriggerRateLimiter:
+    """In-memory rate limiter for outbound call triggers to prevent abuse."""
+
+    def __init__(self, max_requests: int = 10, window_seconds: float = 60.0) -> None:
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._requests: dict[str, deque[float]] = defaultdict(deque)
+
+    def is_allowed(self, key: str) -> bool:
+        now = time.time()
+        window_start = now - self.window_seconds
+        timestamps = self._requests[key]
+        while timestamps and timestamps[0] < window_start:
+            timestamps.popleft()
+        if len(timestamps) >= self.max_requests:
+            return False
+        timestamps.append(now)
+        return True
+
+    def reset(self) -> None:
+        self._requests.clear()
+
+
+trigger_rate_limiter = CallTriggerRateLimiter(max_requests=10, window_seconds=60.0)
 
 
 @app.get("/health")
@@ -55,6 +105,11 @@ def trigger_outbound_call(
         provided_token, configured_token
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+    client_host = request.client.host if request.client else "unknown"
+    rate_limit_key = f"{client_host}:{payload.to_phone_number}"
+    if not trigger_rate_limiter.is_allowed(rate_limit_key):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded for outbound calls")
 
     if not settings.twilio_public_base_url:
         raise HTTPException(status_code=500, detail="Twilio public base URL is not configured")
@@ -192,11 +247,12 @@ def _response_for_turn(
     except PersistenceError as error:
         raise HTTPException(status_code=503, detail="Conversation finalization unavailable") from error
     except Exception as error:
+        logger.error("Telephony provider error during turn execution: %s", error, exc_info=True)
         engine.fail()
         try:
             repository.persist_call(engine.build_result(()), patient_id="local-patient")
-        except PersistenceError:
-            pass
+        except PersistenceError as persist_err:
+            logger.error("Failed to persist failed session state: %s", persist_err, exc_info=True)
         raise HTTPException(status_code=502, detail="Telephony provider unavailable") from error
     _save_turn(repository, engine, event_key, response_body)
     return Response(content=response_body, media_type="application/xml")
@@ -230,11 +286,12 @@ async def twilio_voice_start(request: Request) -> Response:
             _public_url(request, TWILIO_READINESS_PATH, engine.revision),
         )
     except Exception as error:
+        logger.error("Telephony provider error during call start: %s", error, exc_info=True)
         engine.fail()
         try:
             repository.persist_call(engine.build_result(()), patient_id="local-patient")
-        except PersistenceError:
-            pass
+        except PersistenceError as persist_err:
+            logger.error("Failed to persist failed session state on start: %s", persist_err, exc_info=True)
         raise HTTPException(status_code=502, detail="Telephony provider unavailable") from error
     _save_turn(repository, engine, event_key, response_body)
     return Response(content=response_body, media_type="application/xml")
