@@ -3,11 +3,43 @@ from datetime import datetime, timezone
 import pytest
 
 from app.mock_call import AnswerClassification, run_mock_call
-from app.persistence import LocalCallStore, PersistenceError
+from app.persistence import (
+    CallPersistenceRepository,
+    CallQuestion,
+    CognitiveSession,
+    LocalCallStore,
+    PersistenceError,
+    SessionMetric,
+)
 
 
 STARTED_AT = datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
 ENDED_AT = datetime(2026, 1, 1, 9, 1, tzinfo=timezone.utc)
+
+
+class RepositorySpy:
+    def __init__(self) -> None:
+        self.backend = LocalCallStore()
+        self.persist_calls = 0
+
+    def get_result(self, session_id: str):
+        return self.backend.get_result(session_id)
+
+    def create_or_update_session(self, session: CognitiveSession) -> CognitiveSession:
+        return self.backend.create_or_update_session(session)
+
+    def store_call_question(self, question: CallQuestion) -> CallQuestion:
+        return self.backend.store_call_question(question)
+
+    def store_session_metric(self, metric: SessionMetric) -> SessionMetric:
+        return self.backend.store_session_metric(metric)
+
+    def finalize_session(self, session_id: str):
+        return self.backend.finalize_session(session_id)
+
+    def persist_call(self, *args, **kwargs):
+        self.persist_calls += 1
+        return self.backend.persist_call(*args, **kwargs)
 
 
 def run_with_store(responses: list[str | None], session_id: str):
@@ -37,6 +69,21 @@ def test_completed_session_persistence() -> None:
     assert session.termination_reason == "COMPLETED"
     assert store.count("cognitive_sessions") == 1
     assert store.count("call_questions") == 5
+
+
+def test_mock_call_uses_repository_interface() -> None:
+    repository = RepositorySpy()
+
+    assert isinstance(repository, CallPersistenceRepository)
+    result = run_mock_call(
+        ["yes", "monday", "january", "london", "toast", "music"],
+        store=repository,
+        session_id="session-repository-interface",
+    )
+
+    assert result.status == "COMPLETED"
+    assert repository.persist_calls == 1
+    assert repository.backend.count("cognitive_sessions") == 1
 
 
 def test_correct_answer_produces_full_accuracy_metric() -> None:

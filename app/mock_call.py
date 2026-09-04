@@ -9,7 +9,7 @@ from uuid import uuid4
 from app.telephony.mock import MockTelephonyAdapter
 
 if TYPE_CHECKING:
-    from app.persistence import LocalCallStore, PersistedCall
+    from app.persistence import CallPersistenceRepository, PersistedCall
 
 
 class AnswerClassification(str, Enum):
@@ -134,7 +134,7 @@ def run_mock_call(
     responses: list[str | None | MockSpeechResult],
     questions: tuple[MockQuestion, ...] = QUESTIONS,
     *,
-    store: LocalCallStore | None = None,
+    store: CallPersistenceRepository | None = None,
     patient_id: str = "local-patient",
     session_id: str | None = None,
     started_at: datetime | None = None,
@@ -188,9 +188,9 @@ def run_mock_call(
             call_session_id,
             tuple(question_attempts),
         )
-        from app.persistence import LocalCallStore
+        from app.persistence import create_local_repository
 
-        persisted = (store or LocalCallStore()).persist_call(
+        persisted = (store or create_local_repository()).persist_call(
             result,
             patient_id=patient_id,
             started_at=started_at,

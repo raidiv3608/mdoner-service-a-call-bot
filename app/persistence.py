@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
 import sqlite3
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -63,6 +63,36 @@ class PersistenceError(RuntimeError):
     """Raised when a call result cannot be safely committed."""
 
 
+@runtime_checkable
+class CallPersistenceRepository(Protocol):
+    """Persistence boundary used by the conversation engine."""
+
+    def get_result(self, session_id: str) -> MockCallResult | None:
+        """Return a previously finalized result for idempotent events."""
+
+    def create_or_update_session(self, session: CognitiveSession) -> CognitiveSession:
+        """Create a session or preserve the existing session record."""
+
+    def store_call_question(self, question: CallQuestion) -> CallQuestion:
+        """Store one call question attempt idempotently."""
+
+    def store_session_metric(self, metric: SessionMetric) -> SessionMetric:
+        """Store one session metric idempotently."""
+
+    def finalize_session(self, session_id: str) -> PersistedCall:
+        """Load the finalized session aggregate."""
+
+    def persist_call(
+        self,
+        result: MockCallResult,
+        *,
+        patient_id: str = "local-patient",
+        started_at: datetime | None = None,
+        ended_at: datetime | None = None,
+    ) -> PersistedCall:
+        """Persist a complete call result."""
+
+
 class LocalCallStore:
     """Small SQLite store used by the local mock call flow and its tests."""
 
@@ -80,6 +110,62 @@ class LocalCallStore:
         """Return the original result for a duplicate local event, if known."""
 
         return self._result_cache.get(session_id)
+
+    def create_or_update_session(self, session: CognitiveSession) -> CognitiveSession:
+        """Create a session while preserving an existing terminal record."""
+
+        existing = self.connection.execute(
+            "SELECT * FROM cognitive_sessions WHERE session_id = ?",
+            (session.session_id,),
+        ).fetchone()
+        if existing is not None:
+            return CognitiveSession(**dict(existing))
+        try:
+            with self.connection:
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO cognitive_sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    tuple(session.__dict__.values()),
+                )
+        except sqlite3.Error as error:
+            raise PersistenceError("Session was not persisted") from error
+        return session
+
+    def store_call_question(self, question: CallQuestion) -> CallQuestion:
+        """Store one question attempt without duplicating it."""
+
+        try:
+            with self.connection:
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO call_questions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    tuple(question.__dict__.values()),
+                )
+        except sqlite3.Error as error:
+            raise PersistenceError("Call question was not persisted") from error
+        return question
+
+    def store_session_metric(self, metric: SessionMetric) -> SessionMetric:
+        """Store one metric without duplicating it."""
+
+        try:
+            with self.connection:
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO session_metrics VALUES (?, ?, ?, ?)",
+                    tuple(metric.__dict__.values()),
+                )
+        except sqlite3.Error as error:
+            raise PersistenceError("Session metric was not persisted") from error
+        return metric
+
+    def finalize_session(self, session_id: str) -> PersistedCall:
+        """Load the stored session aggregate or fail explicitly."""
+
+        try:
+            persisted = self._load_persisted_call(session_id)
+        except sqlite3.Error as error:
+            raise PersistenceError("Session could not be finalized") from error
+        if persisted is None:
+            raise PersistenceError("Session does not exist")
+        return persisted
 
     def _create_schema(self) -> None:
         self.connection.executescript(
@@ -277,6 +363,12 @@ class LocalCallStore:
         return self.connection.execute(
             f"SELECT COUNT(*) FROM {table_name}"
         ).fetchone()[0]
+
+
+def create_local_repository(database_path: str = ":memory:") -> CallPersistenceRepository:
+    """Create the current development repository implementation."""
+
+    return LocalCallStore(database_path)
 
 
 def _termination_reason(result: MockCallResult) -> str:
