@@ -1,7 +1,10 @@
 from app.mock_call import (
     AnswerClassification,
     ConversationState,
+    MockSpeechResult,
+    QUESTIONS,
     ReadinessOutcome,
+    classify_answer,
     classify_readiness,
     run_mock_call,
 )
@@ -31,14 +34,13 @@ def test_incorrect_answer_continues() -> None:
     assert result.questions_completed == 4
 
 
-def test_unscorable_answer_repeats_once_then_skips() -> None:
+def test_unscorable_answer_repeats_once_then_terminates() -> None:
     result = run_mock_call(["yes", "unclear", "", "january", "london", "toast", "music"])
 
-    assert result.status == "COMPLETED"
-    assert result.classifications[:3] == (
+    assert result.status == "STOPPED"
+    assert result.classifications == (
         AnswerClassification.UNSCORABLE,
         AnswerClassification.UNSCORABLE,
-        AnswerClassification.SKIPPED,
     )
 
 
@@ -63,12 +65,16 @@ def test_three_consecutive_incorrect_answers_end_call() -> None:
     )
 
 
-def test_repeated_no_input_is_skipped_and_call_continues() -> None:
+def test_repeated_no_input_terminates_safely() -> None:
     result = run_mock_call(["yes", None, None, "january", "london", "toast", "music"])
 
-    assert result.status == "COMPLETED"
-    assert AnswerClassification.SKIPPED in result.classifications
+    assert result.status == "STOPPED"
+    assert result.classifications == (
+        AnswerClassification.UNSCORABLE,
+        AnswerClassification.UNSCORABLE,
+    )
     assert any("try once more" in entry for entry in result.transcript)
+    assert result.transcript[-1].endswith("end the call now. Goodbye.")
 
 
 def test_successful_completion_has_normal_closing() -> None:
@@ -120,3 +126,11 @@ def test_only_the_five_prototype_questions_are_evaluated() -> None:
     assert result.status == "COMPLETED"
     assert result.questions_completed == 5
     assert result.classifications == (AnswerClassification.CORRECT,) * 5
+
+
+def test_empty_and_low_confidence_speech_are_unscorable() -> None:
+    question = QUESTIONS[0]
+
+    assert classify_answer("", question) is AnswerClassification.UNSCORABLE
+    assert classify_answer(MockSpeechResult("monday", 0.49), question) is AnswerClassification.UNSCORABLE
+    assert classify_answer(MockSpeechResult("wrong", 0.49), question) is AnswerClassification.UNSCORABLE

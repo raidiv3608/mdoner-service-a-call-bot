@@ -1,7 +1,9 @@
 from datetime import datetime, timezone
 
+import pytest
+
 from app.mock_call import AnswerClassification, run_mock_call
-from app.persistence import LocalCallStore
+from app.persistence import LocalCallStore, PersistenceError
 
 
 STARTED_AT = datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
@@ -134,3 +136,56 @@ def test_persisting_the_same_result_does_not_duplicate_records() -> None:
         table: store.count(table)
         for table in ("cognitive_sessions", "call_questions", "session_metrics")
     }
+
+
+def test_duplicate_call_and_answer_event_returns_existing_result() -> None:
+    store = LocalCallStore()
+    responses = ["yes", "monday", "january", "london", "toast", "music"]
+
+    first = run_mock_call(responses, store=store, session_id="session-duplicate")
+    counts_before = tuple(
+        store.count(table)
+        for table in ("cognitive_sessions", "call_questions", "session_metrics")
+    )
+    second = run_mock_call(responses, store=store, session_id="session-duplicate")
+
+    assert second == first
+    assert tuple(
+        store.count(table)
+        for table in ("cognitive_sessions", "call_questions", "session_metrics")
+    ) == counts_before
+
+
+@pytest.mark.parametrize("terminal_status", ["COMPLETED", "EARLY_TERMINATED", "RESCHEDULED", "FAILED"])
+def test_terminal_session_cannot_be_reopened(terminal_status: str) -> None:
+    store = LocalCallStore()
+    result = run_mock_call(
+        ["yes", "monday", "january", "london", "toast", "music"],
+        store=store,
+        session_id=f"session-{terminal_status.lower()}",
+    )
+    store.connection.execute(
+        "UPDATE cognitive_sessions SET status = ? WHERE session_id = ?",
+        (terminal_status, result.session_id),
+    )
+    store.connection.commit()
+
+    persisted = store.persist_call(result)
+
+    assert persisted.session.status == terminal_status
+    assert store.connection.execute(
+        "SELECT status FROM cognitive_sessions WHERE session_id = ?",
+        (result.session_id,),
+    ).fetchone()[0] == terminal_status
+
+
+def test_database_failure_does_not_report_successful_finalization() -> None:
+    store = LocalCallStore()
+    store.close()
+
+    with pytest.raises(PersistenceError):
+        run_mock_call(
+            ["yes", "monday", "january", "london", "toast", "music"],
+            store=store,
+            session_id="session-db-failure",
+        )

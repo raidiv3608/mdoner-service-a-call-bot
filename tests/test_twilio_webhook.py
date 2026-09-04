@@ -74,3 +74,47 @@ def test_voice_start_rejects_invalid_signature() -> None:
     )
 
     assert response.status_code == 403
+
+
+def test_duplicate_webhook_returns_same_greeting_without_new_state(monkeypatch) -> None:
+    params = {"CallSid": "CA_DUPLICATE", "From": "+15550000000"}
+    monkeypatch.setattr(main_module, "twilio_adapter", TwilioAdapter(auth_token=AUTH_TOKEN))
+
+    first = client.post(
+        WEBHOOK_PATH,
+        data=params,
+        headers=signed_headers(params),
+    )
+    second = client.post(
+        WEBHOOK_PATH,
+        data=params,
+        headers=signed_headers(params),
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert first.content == second.content
+
+
+def test_malformed_webhook_input_returns_safe_error() -> None:
+    response = client.post(WEBHOOK_PATH, data={"From": "+15550000000"})
+
+    assert response.status_code == 400
+
+
+def test_provider_failure_returns_safe_error(monkeypatch) -> None:
+    adapter = TwilioAdapter(auth_token=AUTH_TOKEN)
+
+    def fail_greeting() -> str:
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(adapter, "greeting_response", fail_greeting)
+    monkeypatch.setattr(main_module, "twilio_adapter", adapter)
+    params = {"CallSid": "CA_PROVIDER_FAILURE"}
+
+    response = client.post(
+        WEBHOOK_PATH,
+        data=params,
+        headers=signed_headers(params),
+    )
+
+    assert response.status_code == 502

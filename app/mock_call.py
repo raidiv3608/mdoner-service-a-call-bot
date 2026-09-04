@@ -44,6 +44,12 @@ class MockQuestion:
 
 
 @dataclass(frozen=True)
+class MockSpeechResult:
+    text: str | None
+    confidence: float | None = None
+
+
+@dataclass(frozen=True)
 class MockQuestionAttempt:
     question_number: int
     attempt_number: int
@@ -85,10 +91,19 @@ class _ConversationProgress:
     repeated_unscorable: bool = False
 
 
-def classify_answer(answer: str | None, question: MockQuestion) -> AnswerClassification:
+def classify_answer(
+    answer: str | None | MockSpeechResult,
+    question: MockQuestion,
+    confidence: float | None = None,
+) -> AnswerClassification:
     """Classify fixture answers with exact, normalized matching."""
 
+    if isinstance(answer, MockSpeechResult):
+        confidence = answer.confidence
+        answer = answer.text
     normalized = (answer or "").strip().lower()
+    if confidence is not None and confidence < 0.5:
+        return AnswerClassification.UNSCORABLE
     if normalized in {"stop", "quit", "end call"}:
         return AnswerClassification.STOP
     if normalized in {"skip", "skipped"}:
@@ -116,7 +131,7 @@ def classify_readiness(answer: str | None) -> ReadinessOutcome:
 
 
 def run_mock_call(
-    responses: list[str | None],
+    responses: list[str | None | MockSpeechResult],
     questions: tuple[MockQuestion, ...] = QUESTIONS,
     *,
     store: LocalCallStore | None = None,
@@ -130,6 +145,11 @@ def run_mock_call(
     if len(questions) < 5:
         raise ValueError("The prototype requires at least five question fixtures.")
     question_set = questions[:5]
+
+    if store is not None and session_id is not None:
+        existing_result = store.get_result(session_id)
+        if existing_result is not None:
+            return existing_result
 
     adapter = MockTelephonyAdapter(responses)
     classifications: list[AnswerClassification] = []
@@ -200,8 +220,14 @@ def run_mock_call(
         question_index = question_order[progress.question_position]
         question = question_set[question_index]
         adapter.speak(question.prompt)
-        response = adapter.listen()
-        classification = classify_answer(response, question)
+        raw_response = adapter.listen()
+        if isinstance(raw_response, MockSpeechResult):
+            response = raw_response.text
+            confidence = raw_response.confidence
+        else:
+            response = raw_response
+            confidence = None
+        classification = classify_answer(response, question, confidence)
         record_attempt(question_index, question, response, classification)
 
         if classification is AnswerClassification.STOP:
@@ -215,12 +241,9 @@ def run_mock_call(
                 progress.repeated_unscorable = True
                 adapter.speak("I did not catch that. Please take your time and try once more.")
                 continue
-            classifications.append(AnswerClassification.SKIPPED)
-            record_attempt(question_index, question, None, AnswerClassification.SKIPPED)
-            adapter.speak("That is okay. We will move to the next question.")
-            progress.question_position += 1
-            progress.repeated_unscorable = False
-            continue
+            progress.state = ConversationState.STOPPED
+            adapter.speak("I am having trouble hearing you. We will end the call now. Goodbye.")
+            return finish("STOPPED", readiness_outcome)
         if classification is AnswerClassification.SKIPPED:
             classifications.append(classification)
             adapter.speak("That is okay. We will move to the next question.")

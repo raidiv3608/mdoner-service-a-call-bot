@@ -27,15 +27,28 @@ def health_check() -> dict[str, str]:
 async def twilio_voice_start(request: Request) -> Response:
     """Authenticate Twilio's request and return the initial greeting TwiML."""
 
-    form = await request.form()
+    try:
+        form = await request.form()
+    except Exception as error:
+        raise HTTPException(status_code=400, detail="Malformed webhook input") from error
     params = {key: str(value) for key, value in form.items()}
+    if not params.get("CallSid"):
+        raise HTTPException(status_code=400, detail="CallSid is required")
     signature = request.headers.get("X-Twilio-Signature")
     webhook_url = (
         f"{settings.twilio_public_base_url.rstrip('/')}{TWILIO_VOICE_START_PATH}"
         if settings.twilio_public_base_url
         else str(request.url)
     )
-    if not twilio_adapter.validate_webhook(webhook_url, params, signature):
+    try:
+        valid_signature = twilio_adapter.validate_webhook(webhook_url, params, signature)
+    except Exception as error:
+        raise HTTPException(status_code=502, detail="Telephony provider unavailable") from error
+    if not valid_signature:
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
-    return Response(content=twilio_adapter.greeting_response(), media_type="application/xml")
+    try:
+        greeting = twilio_adapter.greeting_response()
+    except Exception as error:
+        raise HTTPException(status_code=502, detail="Telephony provider unavailable") from error
+    return Response(content=greeting, media_type="application/xml")

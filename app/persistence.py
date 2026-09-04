@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
 import sqlite3
@@ -59,16 +59,27 @@ class PersistedCall:
     metrics: tuple[SessionMetric, ...]
 
 
+class PersistenceError(RuntimeError):
+    """Raised when a call result cannot be safely committed."""
+
+
 class LocalCallStore:
     """Small SQLite store used by the local mock call flow and its tests."""
 
     def __init__(self, database_path: str = ":memory:") -> None:
         self.connection = sqlite3.connect(database_path)
         self.connection.row_factory = sqlite3.Row
+        self._persisted_cache: dict[str, PersistedCall] = {}
+        self._result_cache: dict[str, MockCallResult] = {}
         self._create_schema()
 
     def close(self) -> None:
         self.connection.close()
+
+    def get_result(self, session_id: str) -> MockCallResult | None:
+        """Return the original result for a duplicate local event, if known."""
+
+        return self._result_cache.get(session_id)
 
     def _create_schema(self) -> None:
         self.connection.executescript(
@@ -120,6 +131,20 @@ class LocalCallStore:
         ended_at: datetime | None = None,
     ) -> PersistedCall:
         """Persist a complete result idempotently and return its stored records."""
+
+        try:
+            existing = self._load_persisted_call(result.session_id)
+        except sqlite3.Error as error:
+            cached = self._persisted_cache.get(result.session_id)
+            if cached is not None:
+                return cached
+            raise PersistenceError("Call finalization was not persisted") from error
+        if existing is not None:
+            self._persisted_cache[result.session_id] = existing
+            return existing
+        cached = self._persisted_cache.get(result.session_id)
+        if cached is not None:
+            return cached
 
         started = started_at or datetime.now(timezone.utc)
         ended = ended_at or datetime.now(timezone.utc)
@@ -192,28 +217,58 @@ class LocalCallStore:
             if question.classification != "SKIPPED"
         )
 
-        with self.connection:
-            self.connection.execute(
-                """
-                INSERT OR IGNORE INTO cognitive_sessions
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                tuple(session.__dict__.values()),
-            )
-            self.connection.executemany(
-                """
-                INSERT OR IGNORE INTO call_questions
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [tuple(question.__dict__.values()) for question in questions],
-            )
-            self.connection.executemany(
-                """
-                INSERT OR IGNORE INTO session_metrics
-                VALUES (?, ?, ?, ?)
-                """,
-                [tuple(metric.__dict__.values()) for metric in metrics],
-            )
+        try:
+            with self.connection:
+                self.connection.execute(
+                    """
+                    INSERT OR IGNORE INTO cognitive_sessions
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    tuple(session.__dict__.values()),
+                )
+                self.connection.executemany(
+                    """
+                    INSERT OR IGNORE INTO call_questions
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [tuple(question.__dict__.values()) for question in questions],
+                )
+                self.connection.executemany(
+                    """
+                    INSERT OR IGNORE INTO session_metrics
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    [tuple(metric.__dict__.values()) for metric in metrics],
+                )
+        except sqlite3.Error as error:
+            raise PersistenceError("Call finalization was not persisted") from error
+
+        persisted = PersistedCall(session, questions, metrics)
+        self._persisted_cache[result.session_id] = persisted
+        self._result_cache[result.session_id] = replace(
+            result,
+            persisted_call=persisted,
+        )
+        return persisted
+
+    def _load_persisted_call(self, session_id: str) -> PersistedCall | None:
+        session_row = self.connection.execute(
+            "SELECT * FROM cognitive_sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if session_row is None:
+            return None
+        session = CognitiveSession(**dict(session_row))
+        question_rows = self.connection.execute(
+            "SELECT * FROM call_questions WHERE session_id = ? ORDER BY question_number, attempt_number",
+            (session_id,),
+        ).fetchall()
+        questions = tuple(CallQuestion(**dict(row)) for row in question_rows)
+        metric_rows = self.connection.execute(
+            "SELECT * FROM session_metrics WHERE session_id = ? ORDER BY metric_id",
+            (session_id,),
+        ).fetchall()
+        metrics = tuple(SessionMetric(**dict(row)) for row in metric_rows)
         return PersistedCall(session, questions, metrics)
 
     def count(self, table_name: str) -> int:
