@@ -37,6 +37,11 @@ def isolated_conversation_database(monkeypatch, tmp_path) -> None:
         "settings",
         replace(main_module.settings, local_database_path=str(tmp_path / "service.sqlite3")),
     )
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        replace(main_module.settings, trigger_auth_token="test-trigger-token"),
+    )
 
 
 def test_voice_start_returns_greeting_twiml(monkeypatch) -> None:
@@ -182,6 +187,7 @@ def test_trigger_outbound_call_returns_call_sid(monkeypatch) -> None:
     response = client.post(
         "/v1/calls/trigger",
         json={"to_phone_number": "+15551234567"},
+        headers={"X-Service-A-Trigger-Token": "test-trigger-token"},
     )
 
     assert response.status_code == 200
@@ -198,6 +204,7 @@ def test_trigger_rejects_invalid_phone_number(monkeypatch) -> None:
     response = client.post(
         "/v1/calls/trigger",
         json={"to_phone_number": "555-123-4567"},
+        headers={"X-Service-A-Trigger-Token": "test-trigger-token"},
     )
 
     assert response.status_code == 422
@@ -215,6 +222,7 @@ def test_trigger_returns_safe_error_on_provider_failure(monkeypatch) -> None:
     response = client.post(
         "/v1/calls/trigger",
         json={"to_phone_number": "+15551234567"},
+        headers={"X-Service-A-Trigger-Token": "test-trigger-token"},
     )
 
     assert response.status_code == 502
@@ -232,12 +240,33 @@ def test_trigger_builds_exact_voice_webhook_url(monkeypatch) -> None:
     response = client.post(
         "/v1/calls/trigger",
         json={"to_phone_number": "+447700900123"},
+        headers={"X-Service-A-Trigger-Token": "test-trigger-token"},
     )
 
     assert response.status_code == 200
     assert adapter.calls == [
         ("+447700900123", "https://service.example.com/webhooks/twilio/voice/start")
     ]
+
+
+def test_trigger_rejects_missing_authorization() -> None:
+    response = client.post(
+        "/v1/calls/trigger",
+        json={"to_phone_number": "+15551234567"},
+    )
+
+    assert response.status_code == 401
+    assert "test-trigger-token" not in response.text
+
+
+def test_trigger_rejects_invalid_authorization() -> None:
+    response = client.post(
+        "/v1/calls/trigger",
+        json={"to_phone_number": "+15551234567"},
+        headers={"X-Service-A-Trigger-Token": "wrong-token"},
+    )
+
+    assert response.status_code == 401
 
 
 class MockTwilioAdapter:
@@ -344,6 +373,79 @@ def test_real_flow_unscorable_repeats_once_then_terminates() -> None:
     assert terminal.status_code == 200
     assert "end the call now" in terminal.text
     assert "<Hangup" in terminal.text
+
+
+@pytest.mark.parametrize("speech,confidence", [(None, "0.9"), ("   ", "0.9"), ("wrong", "bad"), ("wrong", "2.0")])
+def test_invalid_or_missing_speech_metadata_is_unscorable(
+    speech: str | None,
+    confidence: str,
+) -> None:
+    call_sid = f"CA_SPEECH_INVALID_{confidence}_{speech}"
+    start_real_flow(call_sid)
+    submit_readiness(call_sid, "yes")
+    path = "/webhooks/twilio/voice/answer"
+    params = {"CallSid": call_sid, "Confidence": confidence}
+    if speech is not None:
+        params["SpeechResult"] = speech
+    response = client.post(
+        path + "?turn=2",
+        data=params,
+        headers=signed_headers_for(path, params, "?turn=2"),
+    )
+
+    assert response.status_code == 200
+    assert "try once more" in response.text
+
+
+def test_missing_confidence_and_valid_confidence_are_allowed() -> None:
+    missing_confidence_sid = "CA_SPEECH_NO_CONFIDENCE"
+    start_real_flow(missing_confidence_sid)
+    submit_readiness(missing_confidence_sid, "yes")
+    response = submit_answer(missing_confidence_sid, "monday", 2)
+    assert response.status_code == 200
+    assert "What day is it today?" not in response.text
+
+    valid_confidence_sid = "CA_SPEECH_VALID_CONFIDENCE"
+    start_real_flow(valid_confidence_sid)
+    submit_readiness(valid_confidence_sid, "yes")
+    response = submit_answer(valid_confidence_sid, "monday", 2)
+    assert response.status_code == 200
+    assert "What day is it today?" not in response.text
+
+
+def test_malformed_stored_state_returns_safe_error(monkeypatch) -> None:
+    call_sid = "CA_MALFORMED_STATE"
+    start_real_flow(call_sid)
+    database_path = main_module.settings.local_database_path
+    store = LocalCallStore(database_path)
+    store.connection.execute(
+        "UPDATE conversation_states SET state_json = ? WHERE session_id = ?",
+        ("{not-json", call_sid),
+    )
+    store.connection.commit()
+    params = {"CallSid": call_sid, "SpeechResult": "yes", "Confidence": "0.9"}
+    path = "/webhooks/twilio/voice/readiness"
+
+    response = client.post(
+        path + "?turn=1",
+        data=params,
+        headers=signed_headers_for(path, params, "?turn=1"),
+    )
+
+    assert response.status_code == 503
+    assert "Traceback" not in response.text
+
+
+def test_terminal_session_rejects_later_turn() -> None:
+    call_sid = "CA_TERMINAL_RETRY"
+    start_real_flow(call_sid)
+    first = submit_readiness(call_sid, "yes")
+    assert first.status_code == 200
+    terminal = submit_answer(call_sid, "stop", 2)
+    assert terminal.status_code == 200
+    retry = submit_answer(call_sid, "monday", 3)
+
+    assert retry.status_code == 409
 
 
 def test_real_flow_three_incorrect_answers_terminate() -> None:

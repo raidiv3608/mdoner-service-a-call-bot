@@ -56,6 +56,12 @@ class RepositorySpy:
     ) -> None:
         self.backend.save_conversation_state(record, event_key, response_body)
 
+    def claim_event(self, session_id: str, event_key: str) -> bool:
+        return self.backend.claim_event(session_id, event_key)
+
+    def release_event(self, session_id: str, event_key: str) -> None:
+        self.backend.release_event(session_id, event_key)
+
 
 def run_with_store(responses: list[str | None], session_id: str):
     store = LocalCallStore()
@@ -265,3 +271,19 @@ def test_database_failure_does_not_report_successful_finalization() -> None:
             store=store,
             session_id="session-db-failure",
         )
+
+
+def test_duplicate_event_claim_is_atomic_across_store_connections(tmp_path) -> None:
+    database_path = str(tmp_path / "claims.sqlite3")
+    first_store = LocalCallStore(database_path)
+    second_store = LocalCallStore(database_path)
+
+    assert first_store.claim_event("session-claim", "answer:2") is True
+    assert second_store.claim_event("session-claim", "answer:2") is False
+
+    first_store.save_conversation_state(
+        ConversationRecord("session-claim", "{}"),
+        "answer:2",
+        "response",
+    )
+    assert second_store.get_event_response("session-claim", "answer:2") == "response"

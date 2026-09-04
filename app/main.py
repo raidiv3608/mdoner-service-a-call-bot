@@ -2,6 +2,7 @@
 
 import json
 import hashlib
+import hmac
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
@@ -9,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.mock_call import ConversationEngine, ConversationState
+from app.mock_call import MockSpeechResult
 from app.persistence import ConversationRecord, LocalCallStore, PersistenceError
 from app.question_planner import QuestionPlanner
 from app.telephony.twilio import TwilioAdapter
@@ -41,15 +43,25 @@ def health_check() -> dict[str, str]:
 
 
 @app.post("/v1/calls/trigger")
-def trigger_outbound_call(request: CallTriggerRequest) -> dict[str, str]:
+def trigger_outbound_call(
+    request: Request,
+    payload: CallTriggerRequest,
+) -> dict[str, str]:
     """Start one developer-triggered outbound call."""
+
+    configured_token = settings.trigger_auth_token
+    provided_token = request.headers.get("X-Service-A-Trigger-Token", "")
+    if not configured_token or not provided_token or not hmac.compare_digest(
+        provided_token, configured_token
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     if not settings.twilio_public_base_url:
         raise HTTPException(status_code=500, detail="Twilio public base URL is not configured")
     voice_url = f"{settings.twilio_public_base_url.rstrip('/')}{TWILIO_VOICE_START_PATH}"
     try:
         call_sid = twilio_adapter.start_outbound_call(
-            request.to_phone_number,
+            payload.to_phone_number,
             voice_url,
         )
     except Exception as error:
@@ -100,6 +112,48 @@ def _turn_value(request: Request) -> int:
         return int(raw_turn)
     except ValueError as error:
         raise HTTPException(status_code=400, detail="Invalid conversation turn") from error
+
+
+def _speech_input(params: dict[str, str]) -> str | MockSpeechResult | None:
+    speech = params.get("SpeechResult")
+    confidence = params.get("Confidence")
+    if confidence is None or not confidence.strip():
+        return speech
+    try:
+        value = float(confidence)
+    except (TypeError, ValueError):
+        return MockSpeechResult(speech, 0.0)
+    if not 0.0 <= value <= 1.0:
+        return MockSpeechResult(speech, 0.0)
+    return MockSpeechResult(speech, value)
+
+
+def _claim_event(repository: LocalCallStore, session_id: str, event_key: str) -> bool:
+    try:
+        if repository.get_event_response(session_id, event_key) is not None:
+            return False
+        if not repository.claim_event(session_id, event_key):
+            return False
+        return True
+    except PersistenceError as error:
+        raise HTTPException(status_code=503, detail="Conversation state unavailable") from error
+
+
+def _release_event(repository: LocalCallStore, session_id: str, event_key: str) -> None:
+    try:
+        repository.release_event(session_id, event_key)
+    except PersistenceError:
+        pass
+
+
+def _safe_engine_from_state(repository: LocalCallStore, session_id: str) -> ConversationEngine:
+    record = repository.get_conversation_state(session_id)
+    if record is None:
+        raise HTTPException(status_code=409, detail="Conversation state not found")
+    try:
+        return ConversationEngine.from_state(session_id, json.loads(record.state_json))
+    except (TypeError, ValueError, KeyError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=503, detail="Conversation state unavailable") from error
 
 
 def _save_turn(
@@ -159,6 +213,11 @@ async def twilio_voice_start(request: Request) -> Response:
     existing = repository.get_event_response(session_id, event_key)
     if existing is not None:
         return Response(content=existing, media_type="application/xml")
+    if not _claim_event(repository, session_id, event_key):
+        existing = repository.get_event_response(session_id, event_key)
+        if existing is not None:
+            return Response(content=existing, media_type="application/xml")
+        raise HTTPException(status_code=409, detail="Event is already being processed")
     plan = question_planner.plan(
         "local-patient",
         seed=_plan_seed(session_id),
@@ -190,13 +249,22 @@ async def twilio_voice_readiness(request: Request) -> Response:
     existing = repository.get_event_response(params["CallSid"], event_key)
     if existing is not None:
         return Response(content=existing, media_type="application/xml")
-    record = repository.get_conversation_state(params["CallSid"])
-    if record is None:
-        raise HTTPException(status_code=409, detail="Conversation state not found")
-    engine = ConversationEngine.from_state(params["CallSid"], json.loads(record.state_json))
+    if not _claim_event(repository, params["CallSid"], event_key):
+        existing = repository.get_event_response(params["CallSid"], event_key)
+        if existing is not None:
+            return Response(content=existing, media_type="application/xml")
+        raise HTTPException(status_code=409, detail="Event is already being processed")
+    engine = _safe_engine_from_state(repository, params["CallSid"])
     if engine.revision != turn_number:
         raise HTTPException(status_code=409, detail="Stale conversation turn")
-    turn = engine.submit_readiness(params.get("SpeechResult"))
+    if engine.state in {
+        ConversationState.COMPLETED,
+        ConversationState.EARLY_TERMINATED,
+        ConversationState.RESCHEDULED,
+        ConversationState.FAILED,
+    }:
+        raise HTTPException(status_code=409, detail="Conversation is already terminal")
+    turn = engine.submit_readiness(_speech_input(params))
     return _response_for_turn(request, repository, engine, turn.messages, event_key)
 
 
@@ -209,21 +277,20 @@ async def twilio_voice_answer(request: Request) -> Response:
     existing = repository.get_event_response(params["CallSid"], event_key)
     if existing is not None:
         return Response(content=existing, media_type="application/xml")
-    record = repository.get_conversation_state(params["CallSid"])
-    if record is None:
-        raise HTTPException(status_code=409, detail="Conversation state not found")
-    engine = ConversationEngine.from_state(params["CallSid"], json.loads(record.state_json))
+    if not _claim_event(repository, params["CallSid"], event_key):
+        existing = repository.get_event_response(params["CallSid"], event_key)
+        if existing is not None:
+            return Response(content=existing, media_type="application/xml")
+        raise HTTPException(status_code=409, detail="Event is already being processed")
+    engine = _safe_engine_from_state(repository, params["CallSid"])
     if engine.revision != turn_number:
         raise HTTPException(status_code=409, detail="Stale conversation turn")
-    confidence = params.get("Confidence")
-    speech = params.get("SpeechResult")
-    answer = speech
-    if confidence:
-        try:
-            from app.mock_call import MockSpeechResult
-
-            answer = MockSpeechResult(speech, float(confidence))
-        except ValueError:
-            answer = speech
-    turn = engine.submit_answer(answer)
+    if engine.state in {
+        ConversationState.COMPLETED,
+        ConversationState.EARLY_TERMINATED,
+        ConversationState.RESCHEDULED,
+        ConversationState.FAILED,
+    }:
+        raise HTTPException(status_code=409, detail="Conversation is already terminal")
+    turn = engine.submit_answer(_speech_input(params))
     return _response_for_turn(request, repository, engine, turn.messages, event_key)

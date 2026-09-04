@@ -13,3 +13,7 @@ Scope:
 
 This repository is intended for development and testing before integration
 into the main MDoNER project.
+
+The developer outbound-call endpoint requires the `SERVICE_A_TRIGGER_AUTH_TOKEN`
+environment variable and the same value in the `X-Service-A-Trigger-Token`
+request header. Do not log or include this token in responses.

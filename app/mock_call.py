@@ -441,9 +441,13 @@ def classify_answer(
     return AnswerClassification.INCORRECT
 
 
-def classify_readiness(answer: str | None) -> ReadinessOutcome:
+def classify_readiness(answer: str | None | MockSpeechResult) -> ReadinessOutcome:
     """Classify the patient's deterministic readiness response."""
 
+    if isinstance(answer, MockSpeechResult):
+        if answer.confidence is not None and not 0.0 <= answer.confidence <= 1.0:
+            return ReadinessOutcome.UNKNOWN
+        answer = answer.text
     normalized = (answer or "").strip().lower()
     if normalized in {"stop", "quit", "end call"}:
         return ReadinessOutcome.STOP

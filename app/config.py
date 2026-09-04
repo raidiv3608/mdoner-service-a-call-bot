@@ -16,6 +16,7 @@ class Settings:
     twilio_from_phone_number: str = os.getenv("TWILIO_FROM_PHONE_NUMBER", "")
     twilio_public_base_url: str = os.getenv("TWILIO_PUBLIC_BASE_URL", "")
     local_database_path: str = os.getenv("SERVICE_A_DATABASE_PATH", "service_a.sqlite3")
+    trigger_auth_token: str = os.getenv("SERVICE_A_TRIGGER_AUTH_TOKEN", "")
 
 
 settings = Settings()

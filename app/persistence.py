@@ -117,6 +117,12 @@ class CallPersistenceRepository(Protocol):
     ) -> None:
         """Atomically save state and the response for one webhook event."""
 
+    def claim_event(self, session_id: str, event_key: str) -> bool:
+        """Atomically claim an event before advancing conversation state."""
+
+    def release_event(self, session_id: str, event_key: str) -> None:
+        """Release an event claim when processing cannot complete."""
+
 
 class LocalCallStore:
     """Small SQLite store used by the local mock call flow and its tests."""
@@ -250,6 +256,11 @@ class LocalCallStore:
                 response_body TEXT NOT NULL,
                 PRIMARY KEY (session_id, event_key)
             );
+            CREATE TABLE IF NOT EXISTS conversation_event_claims (
+                session_id TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                PRIMARY KEY (session_id, event_key)
+            );
             """
         )
         columns = {
@@ -269,6 +280,27 @@ class LocalCallStore:
                     f"ALTER TABLE call_questions ADD COLUMN {column} {definition}"
                 )
         self.connection.commit()
+
+    def claim_event(self, session_id: str, event_key: str) -> bool:
+        try:
+            with self.connection:
+                cursor = self.connection.execute(
+                    "INSERT OR IGNORE INTO conversation_event_claims VALUES (?, ?)",
+                    (session_id, event_key),
+                )
+            return cursor.rowcount == 1
+        except sqlite3.Error as error:
+            raise PersistenceError("Conversation event was not claimed") from error
+
+    def release_event(self, session_id: str, event_key: str) -> None:
+        try:
+            with self.connection:
+                self.connection.execute(
+                    "DELETE FROM conversation_event_claims WHERE session_id = ? AND event_key = ?",
+                    (session_id, event_key),
+                )
+        except sqlite3.Error as error:
+            raise PersistenceError("Conversation event claim was not released") from error
 
     def get_conversation_state(self, session_id: str) -> ConversationRecord | None:
         row = self.connection.execute(
