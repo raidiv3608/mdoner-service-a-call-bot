@@ -1,0 +1,136 @@
+from datetime import datetime, timezone
+
+from app.mock_call import AnswerClassification, run_mock_call
+from app.persistence import LocalCallStore
+
+
+STARTED_AT = datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
+ENDED_AT = datetime(2026, 1, 1, 9, 1, tzinfo=timezone.utc)
+
+
+def run_with_store(responses: list[str | None], session_id: str):
+    store = LocalCallStore()
+    result = run_mock_call(
+        responses,
+        store=store,
+        session_id=session_id,
+        started_at=STARTED_AT,
+        ended_at=ENDED_AT,
+    )
+    return store, result
+
+
+def test_completed_session_persistence() -> None:
+    store, result = run_with_store(
+        ["yes", "monday", "january", "london", "toast", "music"],
+        "session-complete",
+    )
+
+    session = result.persisted_call.session
+    assert session.session_id == "session-complete"
+    assert session.patient_id == "local-patient"
+    assert session.source == "CALL"
+    assert session.activity_type == "DAILY_CALL"
+    assert session.status == "COMPLETED"
+    assert session.termination_reason == "COMPLETED"
+    assert store.count("cognitive_sessions") == 1
+    assert store.count("call_questions") == 5
+
+
+def test_correct_answer_produces_full_accuracy_metric() -> None:
+    _, result = run_with_store(
+        ["yes", "monday", "january", "london", "toast", "music"],
+        "session-correct",
+    )
+
+    assert len(result.persisted_call.metrics) == 5
+    assert {metric.accuracy for metric in result.persisted_call.metrics} == {1.0}
+
+
+def test_incorrect_answer_produces_zero_accuracy_metric() -> None:
+    _, result = run_with_store(
+        ["yes", "wrong", "january", "london", "toast", "music"],
+        "session-incorrect",
+    )
+
+    assert 0.0 in {metric.accuracy for metric in result.persisted_call.metrics}
+
+
+def test_unscorable_answer_produces_null_accuracy_metric() -> None:
+    _, result = run_with_store(
+        ["yes", "unclear", "monday", "january", "london", "toast", "music"],
+        "session-unscorable",
+    )
+
+    unscorable = [
+        question
+        for question in result.persisted_call.questions
+        if question.classification == AnswerClassification.UNSCORABLE.value
+    ]
+    assert len(unscorable) == 1
+    assert any(
+        metric.call_question_id.endswith(":1:1") and metric.accuracy is None
+        for metric in result.persisted_call.metrics
+    )
+
+
+def test_skipped_answer_has_no_accuracy_metric() -> None:
+    store, result = run_with_store(
+        ["yes", "skip", "january", "london", "toast", "music"],
+        "session-skipped",
+    )
+
+    skipped = [
+        question
+        for question in result.persisted_call.questions
+        if question.classification == AnswerClassification.SKIPPED.value
+    ]
+    assert len(skipped) == 1
+    assert all(metric.call_question_id != skipped[0].call_question_id for metric in result.persisted_call.metrics)
+    assert store.count("session_metrics") == 4
+
+
+def test_early_termination_is_persisted() -> None:
+    store, result = run_with_store(
+        ["yes", "wrong", "wrong", "wrong"],
+        "session-stopped",
+    )
+
+    session = result.persisted_call.session
+    assert session.status == "STOPPED"
+    assert session.termination_reason == "THREE_CONSECUTIVE_INCORRECT"
+    assert store.count("cognitive_sessions") == 1
+    assert store.count("call_questions") == 3
+
+
+def test_session_aggregation_is_deterministic() -> None:
+    _, result = run_with_store(
+        ["yes", "wrong", "january", "london", "toast", "music"],
+        "session-aggregate",
+    )
+
+    session = result.persisted_call.session
+    assert session.session_score == 0.8
+    assert session.summary_accuracy == 0.8
+    assert session.hesitation_count == 0
+    assert session.duration_ms == 60_000
+
+
+def test_persisting_the_same_result_does_not_duplicate_records() -> None:
+    store = LocalCallStore()
+    result = run_mock_call(
+        ["yes", "monday", "january", "london", "toast", "music"],
+        store=store,
+        session_id="session-idempotent",
+    )
+    counts_before = {
+        table: store.count(table)
+        for table in ("cognitive_sessions", "call_questions", "session_metrics")
+    }
+
+    store.persist_call(result)
+
+    assert counts_before == {
+        table: store.count(table)
+        for table in ("cognitive_sessions", "call_questions", "session_metrics")
+    }

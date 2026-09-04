@@ -1,9 +1,15 @@
 """Deterministic local call flow for Service A."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import Enum
+from typing import TYPE_CHECKING
+from uuid import uuid4
 
 from app.telephony.mock import MockTelephonyAdapter
+
+if TYPE_CHECKING:
+    from app.persistence import LocalCallStore, PersistedCall
 
 
 class AnswerClassification(str, Enum):
@@ -37,6 +43,16 @@ class MockQuestion:
     difficulty: int
 
 
+@dataclass(frozen=True)
+class MockQuestionAttempt:
+    question_number: int
+    attempt_number: int
+    prompt: str
+    response: str | None
+    classification: AnswerClassification
+    difficulty: int
+
+
 QUESTIONS = (
     MockQuestion("What day is it today?", ("monday",), 1),
     MockQuestion("What month is it?", ("january",), 2),
@@ -55,6 +71,9 @@ class MockCallResult:
     questions_completed: int
     consecutive_incorrect: int
     transcript: tuple[str, ...]
+    session_id: str
+    question_attempts: tuple[MockQuestionAttempt, ...]
+    persisted_call: PersistedCall | None = None
 
 
 @dataclass
@@ -99,6 +118,12 @@ def classify_readiness(answer: str | None) -> ReadinessOutcome:
 def run_mock_call(
     responses: list[str | None],
     questions: tuple[MockQuestion, ...] = QUESTIONS,
+    *,
+    store: LocalCallStore | None = None,
+    patient_id: str = "local-patient",
+    session_id: str | None = None,
+    started_at: datetime | None = None,
+    ended_at: datetime | None = None,
 ) -> MockCallResult:
     """Run one complete deterministic mock call and return its session result."""
 
@@ -108,7 +133,51 @@ def run_mock_call(
 
     adapter = MockTelephonyAdapter(responses)
     classifications: list[AnswerClassification] = []
+    question_attempts: list[MockQuestionAttempt] = []
+    attempt_counts: dict[int, int] = {}
+    call_session_id = session_id or str(uuid4())
     progress = _ConversationProgress()
+
+    def record_attempt(
+        question_index: int,
+        question: MockQuestion,
+        response: str | None,
+        classification: AnswerClassification,
+    ) -> None:
+        attempt_counts[question_index] = attempt_counts.get(question_index, 0) + 1
+        question_attempts.append(
+            MockQuestionAttempt(
+                question_number=question_index + 1,
+                attempt_number=attempt_counts[question_index],
+                prompt=question.prompt,
+                response=response,
+                classification=classification,
+                difficulty=question.difficulty,
+            )
+        )
+
+    def finish(status: str, readiness_outcome: ReadinessOutcome) -> MockCallResult:
+        result = MockCallResult(
+            status,
+            progress.state,
+            readiness_outcome,
+            tuple(classifications),
+            progress.questions_completed,
+            progress.consecutive_incorrect,
+            tuple(adapter.transcript),
+            call_session_id,
+            tuple(question_attempts),
+        )
+        from app.persistence import LocalCallStore
+
+        persisted = (store or LocalCallStore()).persist_call(
+            result,
+            patient_id=patient_id,
+            started_at=started_at,
+            ended_at=ended_at,
+        )
+        return replace(result, persisted_call=persisted)
+
     adapter.start_call()
     adapter.speak(adapter.greeting_response())
     progress.state = ConversationState.READINESS
@@ -121,15 +190,7 @@ def run_mock_call(
     if readiness_outcome is not ReadinessOutcome.READY:
         progress.state = ConversationState.STOPPED
         adapter.speak("That is okay. We can try again another time. Goodbye.")
-        return MockCallResult(
-            "STOPPED",
-            progress.state,
-            readiness_outcome,
-            tuple(),
-            0,
-            0,
-            tuple(adapter.transcript),
-        )
+        return finish("STOPPED", readiness_outcome)
 
     adapter.speak("Thank you. We will take this one question at a time.")
     progress.state = ConversationState.QUESTIONS
@@ -139,13 +200,15 @@ def run_mock_call(
         question_index = question_order[progress.question_position]
         question = question_set[question_index]
         adapter.speak(question.prompt)
-        classification = classify_answer(adapter.listen(), question)
+        response = adapter.listen()
+        classification = classify_answer(response, question)
+        record_attempt(question_index, question, response, classification)
 
         if classification is AnswerClassification.STOP:
             classifications.append(classification)
             progress.state = ConversationState.STOPPED
             adapter.speak("Understood. Thank you for your time. Goodbye.")
-            return MockCallResult("STOPPED", progress.state, readiness_outcome, tuple(classifications), progress.questions_completed, progress.consecutive_incorrect, tuple(adapter.transcript))
+            return finish("STOPPED", readiness_outcome)
         if classification is AnswerClassification.UNSCORABLE:
             classifications.append(classification)
             if not progress.repeated_unscorable:
@@ -153,6 +216,7 @@ def run_mock_call(
                 adapter.speak("I did not catch that. Please take your time and try once more.")
                 continue
             classifications.append(AnswerClassification.SKIPPED)
+            record_attempt(question_index, question, None, AnswerClassification.SKIPPED)
             adapter.speak("That is okay. We will move to the next question.")
             progress.question_position += 1
             progress.repeated_unscorable = False
@@ -178,7 +242,7 @@ def run_mock_call(
         if progress.consecutive_incorrect >= 3:
             progress.state = ConversationState.STOPPED
             adapter.speak("It seems like this is not a good time. We will end the call now. Goodbye.")
-            return MockCallResult("STOPPED", progress.state, readiness_outcome, tuple(classifications), progress.questions_completed, progress.consecutive_incorrect, tuple(adapter.transcript))
+            return finish("STOPPED", readiness_outcome)
         if progress.consecutive_incorrect == 2:
             adapter.speak("That is okay. I will make the next question a little easier.")
             remaining = question_order[progress.question_position + 1 :]
@@ -188,4 +252,4 @@ def run_mock_call(
 
     progress.state = ConversationState.COMPLETED
     adapter.speak("You have completed all five questions. Thank you for taking part. Goodbye.")
-    return MockCallResult("COMPLETED", progress.state, readiness_outcome, tuple(classifications), progress.questions_completed, progress.consecutive_incorrect, tuple(adapter.transcript))
+    return finish("COMPLETED", readiness_outcome)
