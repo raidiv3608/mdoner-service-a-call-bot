@@ -124,15 +124,31 @@ class CallPersistenceRepository(Protocol):
         """Release an event claim when processing cannot complete."""
 
 
+# Track database paths that have already been initialized in this process to avoid
+# re-running schema DDL and table_info PRAGMAs on every connection.
+_INITIALIZED_DATABASES: set[str] = set()
+
+
 class LocalCallStore:
     """Small SQLite store used by the local mock call flow and its tests."""
 
     def __init__(self, database_path: str = ":memory:") -> None:
+        str_path = str(database_path)
         self.connection = sqlite3.connect(database_path)
         self.connection.row_factory = sqlite3.Row
         self._persisted_cache: dict[str, PersistedCall] = {}
         self._result_cache: dict[str, MockCallResult] = {}
-        self._create_schema()
+        if str_path == ":memory:" or str_path not in _INITIALIZED_DATABASES:
+            self._create_schema()
+            if str_path != ":memory:":
+                _INITIALIZED_DATABASES.add(str_path)
+        else:
+            # Quick check in case the underlying file was wiped or reset
+            has_table = self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cognitive_sessions'"
+            ).fetchone()
+            if not has_table:
+                self._create_schema()
 
     def close(self) -> None:
         self.connection.close()

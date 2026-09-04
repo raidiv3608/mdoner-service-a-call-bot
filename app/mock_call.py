@@ -1,5 +1,7 @@
 """Deterministic local call flow for Service A."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
