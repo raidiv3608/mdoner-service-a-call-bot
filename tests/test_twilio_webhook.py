@@ -274,7 +274,15 @@ def test_real_flow_answer_progresses_to_next_question() -> None:
     response = submit_answer(call_sid, "monday", 2)
 
     assert response.status_code == 200
-    assert "What month is it?" in response.text
+    assert any(
+        prompt in response.text
+        for prompt in (
+            "What month is it?",
+            "What city are you in?",
+            "What did you have for breakfast?",
+            "What is one thing you enjoy?",
+        )
+    )
     assert "What day is it today?" not in response.text
 
 
@@ -330,4 +338,4 @@ def test_duplicate_webhook_replays_response_without_advancing_state() -> None:
     assert first.content == duplicate.content
     next_question = submit_answer(call_sid, "monday", 2)
     assert next_question.status_code == 200
-    assert "What month is it?" in next_question.text
+    assert "What day is it today?" not in next_question.text

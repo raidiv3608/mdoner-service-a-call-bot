@@ -42,6 +42,11 @@ class CallQuestion:
     response: str | None
     classification: str
     difficulty: int
+    accepted_answers_json: str
+    aliases_json: str
+    category: str
+    memory_id: str | None
+    plan_seed: int | None
 
 
 @dataclass(frozen=True)
@@ -156,7 +161,13 @@ class LocalCallStore:
         try:
             with self.connection:
                 self.connection.execute(
-                    "INSERT OR IGNORE INTO call_questions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    """
+                    INSERT OR IGNORE INTO call_questions
+                    (call_question_id, session_id, question_number, attempt_number,
+                     prompt, response, classification, difficulty,
+                     accepted_answers_json, aliases_json, category, memory_id, plan_seed)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
                     tuple(question.__dict__.values()),
                 )
         except sqlite3.Error as error:
@@ -216,6 +227,11 @@ class LocalCallStore:
                 response TEXT,
                 classification TEXT NOT NULL,
                 difficulty INTEGER NOT NULL,
+                accepted_answers_json TEXT NOT NULL DEFAULT '[]',
+                aliases_json TEXT NOT NULL DEFAULT '[]',
+                category TEXT NOT NULL DEFAULT 'GENERAL_AWARENESS',
+                memory_id TEXT,
+                plan_seed INTEGER,
                 UNIQUE (session_id, question_number, attempt_number)
             );
             CREATE TABLE IF NOT EXISTS session_metrics (
@@ -236,6 +252,22 @@ class LocalCallStore:
             );
             """
         )
+        columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(call_questions)")
+        }
+        migrations = {
+            "accepted_answers_json": "TEXT NOT NULL DEFAULT '[]'",
+            "aliases_json": "TEXT NOT NULL DEFAULT '[]'",
+            "category": "TEXT NOT NULL DEFAULT 'GENERAL_AWARENESS'",
+            "memory_id": "TEXT",
+            "plan_seed": "INTEGER",
+        }
+        for column, definition in migrations.items():
+            if column not in columns:
+                self.connection.execute(
+                    f"ALTER TABLE call_questions ADD COLUMN {column} {definition}"
+                )
         self.connection.commit()
 
     def get_conversation_state(self, session_id: str) -> ConversationRecord | None:
@@ -350,6 +382,11 @@ class LocalCallStore:
                 response=attempt.response,
                 classification=attempt.classification.value,
                 difficulty=attempt.difficulty,
+                accepted_answers_json=json.dumps(attempt.accepted_answers),
+                aliases_json=json.dumps(attempt.aliases),
+                category=attempt.category,
+                memory_id=attempt.memory_id,
+                plan_seed=attempt.plan_seed,
             )
             for attempt in result.question_attempts
         )
@@ -378,7 +415,10 @@ class LocalCallStore:
                 self.connection.executemany(
                     """
                     INSERT OR IGNORE INTO call_questions
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (call_question_id, session_id, question_number, attempt_number,
+                     prompt, response, classification, difficulty,
+                     accepted_answers_json, aliases_json, category, memory_id, plan_seed)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [tuple(question.__dict__.values()) for question in questions],
                 )

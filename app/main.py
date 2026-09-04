@@ -1,6 +1,7 @@
 """HTTP application entry point for MDoNER Service A."""
 
 import json
+import hashlib
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
@@ -9,6 +10,7 @@ from pydantic import BaseModel, Field
 from app.config import settings
 from app.mock_call import ConversationEngine, ConversationState
 from app.persistence import ConversationRecord, LocalCallStore, PersistenceError
+from app.question_planner import QuestionPlanner
 from app.telephony.twilio import TwilioAdapter
 
 
@@ -28,6 +30,7 @@ twilio_adapter = TwilioAdapter(
     auth_token=settings.twilio_auth_token,
     from_phone_number=settings.twilio_from_phone_number,
 )
+question_planner = QuestionPlanner()
 
 
 @app.get("/health")
@@ -56,6 +59,10 @@ def trigger_outbound_call(request: CallTriggerRequest) -> dict[str, str]:
 
 def _repository() -> LocalCallStore:
     return LocalCallStore(settings.local_database_path)
+
+
+def _plan_seed(session_id: str) -> int:
+    return int.from_bytes(hashlib.sha256(session_id.encode()).digest()[:8], "big")
 
 
 def _public_url(request: Request, path: str, turn: int | None = None) -> str:
@@ -147,7 +154,11 @@ async def twilio_voice_start(request: Request) -> Response:
     existing = repository.get_event_response(session_id, event_key)
     if existing is not None:
         return Response(content=existing, media_type="application/xml")
-    engine = ConversationEngine(session_id)
+    plan = question_planner.plan(
+        "local-patient",
+        seed=_plan_seed(session_id),
+    )
+    engine = ConversationEngine(session_id, plan=plan)
     turn = engine.start()
     try:
         response_body = twilio_adapter.greeting_gather_response(

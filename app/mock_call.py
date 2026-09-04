@@ -6,6 +6,7 @@ from enum import Enum
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from app.question_planner import QuestionPlan, QuestionPlanner
 from app.telephony.mock import MockTelephonyAdapter
 
 if TYPE_CHECKING:
@@ -41,6 +42,10 @@ class MockQuestion:
     prompt: str
     accepted_answers: tuple[str, ...]
     difficulty: int
+    category: str = "GENERAL_AWARENESS"
+    aliases: tuple[str, ...] = ()
+    memory_id: str | None = None
+    question_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +62,11 @@ class MockQuestionAttempt:
     response: str | None
     classification: AnswerClassification
     difficulty: int
+    accepted_answers: tuple[str, ...] = ()
+    aliases: tuple[str, ...] = ()
+    category: str = "GENERAL_AWARENESS"
+    memory_id: str | None = None
+    plan_seed: int | None = None
 
 
 QUESTIONS = (
@@ -104,13 +114,35 @@ class ConversationEngine:
         self,
         session_id: str,
         questions: tuple[MockQuestion, ...] = QUESTIONS,
+        plan: QuestionPlan | None = None,
     ) -> None:
-        if len(questions) < 5:
+        if plan is not None:
+            questions = tuple(
+                MockQuestion(
+                    prompt=question.prompt_text,
+                    accepted_answers=question.accepted_answers,
+                    difficulty=question.difficulty,
+                    category=question.category.value,
+                    aliases=question.aliases,
+                    memory_id=question.memory_id,
+                    question_id=question.question_id,
+                )
+                for question in plan.questions
+            )
+            self.plan_seed = plan.seed
+            self.plan_question_ids = plan.question_ids
+        else:
+            self.plan_seed = None
+            self.plan_question_ids = tuple(
+                question.question_id or f"fixture-{index + 1}"
+                for index, question in enumerate(questions)
+            )
+        if len(questions) < 5 or len(questions) > 8:
             raise ValueError("The prototype requires at least five question fixtures.")
         self.session_id = session_id
-        self.question_set = questions[:5]
+        self.question_set = questions
         self.progress = _ConversationProgress()
-        self.question_order = list(range(5))
+        self.question_order = list(range(len(questions)))
         self.classifications: list[AnswerClassification] = []
         self.question_attempts: list[MockQuestionAttempt] = []
         self.attempt_counts: dict[int, int] = {}
@@ -176,6 +208,11 @@ class ConversationEngine:
                 response=response,
                 classification=classification,
                 difficulty=question.difficulty,
+                accepted_answers=question.accepted_answers,
+                aliases=question.aliases,
+                category=question.category,
+                memory_id=question.memory_id,
+                plan_seed=self.plan_seed,
             )
         )
         self.classifications.append(classification)
@@ -256,6 +293,11 @@ class ConversationEngine:
                     "response": attempt.response,
                     "classification": attempt.classification.value,
                     "difficulty": attempt.difficulty,
+                    "accepted_answers": attempt.accepted_answers,
+                    "aliases": attempt.aliases,
+                    "category": attempt.category,
+                    "memory_id": attempt.memory_id,
+                    "plan_seed": attempt.plan_seed,
                 }
                 for attempt in self.question_attempts
             ],
@@ -263,6 +305,20 @@ class ConversationEngine:
             "readiness_attempts": self.readiness_attempts,
             "readiness": self.readiness.value,
             "revision": self.revision,
+            "plan_seed": self.plan_seed,
+            "plan_question_ids": self.plan_question_ids,
+            "question_set": [
+                {
+                    "prompt": question.prompt,
+                    "accepted_answers": question.accepted_answers,
+                    "difficulty": question.difficulty,
+                    "category": question.category,
+                    "aliases": question.aliases,
+                    "memory_id": question.memory_id,
+                    "question_id": question.question_id,
+                }
+                for question in self.question_set
+            ],
         }
 
     @classmethod
@@ -273,6 +329,20 @@ class ConversationEngine:
         questions: tuple[MockQuestion, ...] = QUESTIONS,
     ) -> "ConversationEngine":
         engine = cls(session_id, questions)
+        engine.question_set = tuple(
+            MockQuestion(
+                prompt=question["prompt"],
+                accepted_answers=tuple(question["accepted_answers"]),
+                difficulty=question["difficulty"],
+                category=question["category"],
+                aliases=tuple(question["aliases"]),
+                memory_id=question["memory_id"],
+                question_id=question["question_id"],
+            )
+            for question in state["question_set"]
+        )
+        engine.plan_seed = state["plan_seed"]
+        engine.plan_question_ids = tuple(state["plan_question_ids"])
         progress = state["progress"]
         engine.progress = _ConversationProgress(
             state=ConversationState(progress["state"]),
@@ -293,6 +363,11 @@ class ConversationEngine:
                 response=attempt["response"],
                 classification=AnswerClassification(attempt["classification"]),
                 difficulty=attempt["difficulty"],
+                accepted_answers=tuple(attempt.get("accepted_answers", ())),
+                aliases=tuple(attempt.get("aliases", ())),
+                category=attempt.get("category", "GENERAL_AWARENESS"),
+                memory_id=attempt.get("memory_id"),
+                plan_seed=attempt.get("plan_seed"),
             )
             for attempt in state["question_attempts"]
         ]
@@ -345,7 +420,7 @@ def classify_answer(
         return AnswerClassification.SKIPPED
     if not normalized or normalized in {"unclear", "i don't know", "unknown"}:
         return AnswerClassification.UNSCORABLE
-    if normalized in question.accepted_answers:
+    if normalized in (*question.accepted_answers, *question.aliases):
         return AnswerClassification.CORRECT
     return AnswerClassification.INCORRECT
 
@@ -374,6 +449,9 @@ def run_mock_call(
     session_id: str | None = None,
     started_at: datetime | None = None,
     ended_at: datetime | None = None,
+    planner: QuestionPlanner | None = None,
+    plan_seed: int = 0,
+    previous_plan_question_ids: tuple[str, ...] = (),
 ) -> MockCallResult:
     """Run one complete deterministic mock call and return its session result."""
 
@@ -384,7 +462,16 @@ def run_mock_call(
 
     adapter = MockTelephonyAdapter(responses)
     call_session_id = session_id or str(uuid4())
-    engine = ConversationEngine(call_session_id, questions)
+    plan = (
+        planner.plan(
+            patient_id,
+            seed=plan_seed,
+            previous_question_ids=previous_plan_question_ids,
+        )
+        if planner is not None
+        else None
+    )
+    engine = ConversationEngine(call_session_id, questions, plan=plan)
 
     def finish() -> MockCallResult:
         result = engine.build_result(tuple(adapter.transcript))
