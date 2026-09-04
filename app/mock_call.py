@@ -22,6 +22,14 @@ class ReadinessOutcome(str, Enum):
     NO_INPUT = "NO_INPUT"
 
 
+class ConversationState(str, Enum):
+    GREETING = "GREETING"
+    READINESS = "READINESS"
+    QUESTIONS = "QUESTIONS"
+    COMPLETED = "COMPLETED"
+    STOPPED = "STOPPED"
+
+
 @dataclass(frozen=True)
 class MockQuestion:
     prompt: str
@@ -41,11 +49,21 @@ QUESTIONS = (
 @dataclass(frozen=True)
 class MockCallResult:
     status: str
+    state: ConversationState
     readiness: ReadinessOutcome
     classifications: tuple[AnswerClassification, ...]
     questions_completed: int
     consecutive_incorrect: int
     transcript: tuple[str, ...]
+
+
+@dataclass
+class _ConversationProgress:
+    state: ConversationState = ConversationState.GREETING
+    question_position: int = 0
+    questions_completed: int = 0
+    consecutive_incorrect: int = 0
+    repeated_unscorable: bool = False
 
 
 def classify_answer(answer: str | None, question: MockQuestion) -> AnswerClassification:
@@ -84,10 +102,16 @@ def run_mock_call(
 ) -> MockCallResult:
     """Run one complete deterministic mock call and return its session result."""
 
+    if len(questions) < 5:
+        raise ValueError("The prototype requires at least five question fixtures.")
+    question_set = questions[:5]
+
     adapter = MockTelephonyAdapter(responses)
     classifications: list[AnswerClassification] = []
+    progress = _ConversationProgress()
     adapter.start_call()
     adapter.speak(adapter.greeting_response())
+    progress.state = ConversationState.READINESS
     adapter.speak("Are you ready to begin? Please say yes or no.")
     readiness = adapter.listen()
     readiness_outcome = classify_readiness(readiness)
@@ -95,9 +119,11 @@ def run_mock_call(
         adapter.speak("I did not catch that. Please say ready or not ready.")
         readiness_outcome = classify_readiness(adapter.listen())
     if readiness_outcome is not ReadinessOutcome.READY:
+        progress.state = ConversationState.STOPPED
         adapter.speak("That is okay. We can try again another time. Goodbye.")
         return MockCallResult(
             "STOPPED",
+            progress.state,
             readiness_outcome,
             tuple(),
             0,
@@ -106,58 +132,60 @@ def run_mock_call(
         )
 
     adapter.speak("Thank you. We will take this one question at a time.")
-    question_order = list(range(len(questions)))
-    question_position = 0
-    completed = 0
-    consecutive_incorrect = 0
-    no_input_repeated = False
+    progress.state = ConversationState.QUESTIONS
+    question_order = list(range(5))
 
-    while question_position < len(question_order):
-        question_index = question_order[question_position]
-        question = questions[question_index]
+    while progress.question_position < len(question_order):
+        question_index = question_order[progress.question_position]
+        question = question_set[question_index]
         adapter.speak(question.prompt)
         classification = classify_answer(adapter.listen(), question)
 
         if classification is AnswerClassification.STOP:
             classifications.append(classification)
+            progress.state = ConversationState.STOPPED
             adapter.speak("Understood. Thank you for your time. Goodbye.")
-            return MockCallResult("STOPPED", readiness_outcome, tuple(classifications), completed, consecutive_incorrect, tuple(adapter.transcript))
+            return MockCallResult("STOPPED", progress.state, readiness_outcome, tuple(classifications), progress.questions_completed, progress.consecutive_incorrect, tuple(adapter.transcript))
         if classification is AnswerClassification.UNSCORABLE:
             classifications.append(classification)
-            if not no_input_repeated:
-                no_input_repeated = True
+            if not progress.repeated_unscorable:
+                progress.repeated_unscorable = True
                 adapter.speak("I did not catch that. Please take your time and try once more.")
                 continue
             classifications.append(AnswerClassification.SKIPPED)
             adapter.speak("That is okay. We will move to the next question.")
-            question_position += 1
-            no_input_repeated = False
+            progress.question_position += 1
+            progress.repeated_unscorable = False
             continue
         if classification is AnswerClassification.SKIPPED:
             classifications.append(classification)
             adapter.speak("That is okay. We will move to the next question.")
-            question_position += 1
-            no_input_repeated = False
+            progress.question_position += 1
+            progress.repeated_unscorable = False
             continue
 
         classifications.append(classification)
-        no_input_repeated = False
+        progress.repeated_unscorable = False
         if classification is AnswerClassification.CORRECT:
-            completed += 1
-            consecutive_incorrect = 0
-            question_position += 1
+            progress.questions_completed += 1
+            progress.consecutive_incorrect = 0
+            progress.question_position += 1
             continue
 
-        consecutive_incorrect += 1
-        if consecutive_incorrect >= 3:
+        progress.consecutive_incorrect += 1
+        if progress.consecutive_incorrect == 1:
+            adapter.speak("That is okay. We will keep going one step at a time.")
+        if progress.consecutive_incorrect >= 3:
+            progress.state = ConversationState.STOPPED
             adapter.speak("It seems like this is not a good time. We will end the call now. Goodbye.")
-            return MockCallResult("STOPPED", readiness_outcome, tuple(classifications), completed, consecutive_incorrect, tuple(adapter.transcript))
-        if consecutive_incorrect == 2:
+            return MockCallResult("STOPPED", progress.state, readiness_outcome, tuple(classifications), progress.questions_completed, progress.consecutive_incorrect, tuple(adapter.transcript))
+        if progress.consecutive_incorrect == 2:
             adapter.speak("That is okay. I will make the next question a little easier.")
-            remaining = question_order[question_position + 1 :]
-            remaining.sort(key=lambda index: questions[index].difficulty)
-            question_order[question_position + 1 :] = remaining
-        question_position += 1
+            remaining = question_order[progress.question_position + 1 :]
+            remaining.sort(key=lambda index: question_set[index].difficulty)
+            question_order[progress.question_position + 1 :] = remaining
+        progress.question_position += 1
 
+    progress.state = ConversationState.COMPLETED
     adapter.speak("You have completed all five questions. Thank you for taking part. Goodbye.")
-    return MockCallResult("COMPLETED", readiness_outcome, tuple(classifications), completed, consecutive_incorrect, tuple(adapter.transcript))
+    return MockCallResult("COMPLETED", progress.state, readiness_outcome, tuple(classifications), progress.questions_completed, progress.consecutive_incorrect, tuple(adapter.transcript))

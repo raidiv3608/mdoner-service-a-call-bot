@@ -1,5 +1,6 @@
 from app.mock_call import (
     AnswerClassification,
+    ConversationState,
     ReadinessOutcome,
     classify_readiness,
     run_mock_call,
@@ -10,6 +11,7 @@ def test_normal_successful_call() -> None:
     result = run_mock_call(["yes", "monday", "january", "london", "toast", "music"])
 
     assert result.status == "COMPLETED"
+    assert result.state is ConversationState.COMPLETED
     assert result.readiness is ReadinessOutcome.READY
     assert result.questions_completed == 5
     assert result.classifications == (
@@ -52,6 +54,7 @@ def test_three_consecutive_incorrect_answers_end_call() -> None:
     result = run_mock_call(["yes", "wrong", "wrong", "wrong"])
 
     assert result.status == "STOPPED"
+    assert result.state is ConversationState.STOPPED
     assert result.consecutive_incorrect == 3
     assert result.classifications == (
         AnswerClassification.INCORRECT,
@@ -95,3 +98,25 @@ def test_readiness_no_input_retries_once() -> None:
 
     assert result.status == "COMPLETED"
     assert result.readiness is ReadinessOutcome.READY
+
+
+def test_two_consecutive_incorrect_answers_select_an_easier_remaining_question() -> None:
+    result = run_mock_call(
+        ["yes", "wrong", "wrong", "music", "toast", "london"]
+    )
+
+    assert result.status == "COMPLETED"
+    assert result.questions_completed == 3
+    assert result.transcript.index("BOT: What is one thing you enjoy?") < result.transcript.index(
+        "BOT: What city are you in?"
+    )
+
+
+def test_only_the_five_prototype_questions_are_evaluated() -> None:
+    result = run_mock_call(
+        ["yes", "monday", "january", "london", "toast", "music", "unexpected"]
+    )
+
+    assert result.status == "COMPLETED"
+    assert result.questions_completed == 5
+    assert result.classifications == (AnswerClassification.CORRECT,) * 5
