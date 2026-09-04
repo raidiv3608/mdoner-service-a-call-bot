@@ -59,6 +59,12 @@ class PersistedCall:
     metrics: tuple[SessionMetric, ...]
 
 
+@dataclass(frozen=True)
+class ConversationRecord:
+    session_id: str
+    state_json: str
+
+
 class PersistenceError(RuntimeError):
     """Raised when a call result cannot be safely committed."""
 
@@ -91,6 +97,20 @@ class CallPersistenceRepository(Protocol):
         ended_at: datetime | None = None,
     ) -> PersistedCall:
         """Persist a complete call result."""
+
+    def get_conversation_state(self, session_id: str) -> ConversationRecord | None:
+        """Load an in-progress conversation snapshot."""
+
+    def get_event_response(self, session_id: str, event_key: str) -> str | None:
+        """Return a previously generated webhook response for a duplicate event."""
+
+    def save_conversation_state(
+        self,
+        record: ConversationRecord,
+        event_key: str,
+        response_body: str,
+    ) -> None:
+        """Atomically save state and the response for one webhook event."""
 
 
 class LocalCallStore:
@@ -204,9 +224,52 @@ class LocalCallStore:
                 call_question_id TEXT NOT NULL UNIQUE REFERENCES call_questions(call_question_id),
                 accuracy REAL
             );
+            CREATE TABLE IF NOT EXISTS conversation_states (
+                session_id TEXT PRIMARY KEY,
+                state_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS conversation_events (
+                session_id TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                response_body TEXT NOT NULL,
+                PRIMARY KEY (session_id, event_key)
+            );
             """
         )
         self.connection.commit()
+
+    def get_conversation_state(self, session_id: str) -> ConversationRecord | None:
+        row = self.connection.execute(
+            "SELECT session_id, state_json FROM conversation_states WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return ConversationRecord(**dict(row)) if row is not None else None
+
+    def get_event_response(self, session_id: str, event_key: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT response_body FROM conversation_events WHERE session_id = ? AND event_key = ?",
+            (session_id, event_key),
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def save_conversation_state(
+        self,
+        record: ConversationRecord,
+        event_key: str,
+        response_body: str,
+    ) -> None:
+        try:
+            with self.connection:
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO conversation_states VALUES (?, ?)",
+                    (record.session_id, record.state_json),
+                )
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO conversation_events VALUES (?, ?, ?)",
+                    (record.session_id, event_key, response_body),
+                )
+        except sqlite3.Error as error:
+            raise PersistenceError("Conversation state was not persisted") from error
 
     def persist_call(
         self,

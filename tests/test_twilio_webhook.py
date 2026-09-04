@@ -1,6 +1,8 @@
 from dataclasses import replace
 import importlib
 
+import pytest
+
 from fastapi.testclient import TestClient
 from twilio.request_validator import RequestValidator
 
@@ -18,6 +20,22 @@ WEBHOOK_URL = f"http://testserver{WEBHOOK_PATH}"
 def signed_headers(params: dict[str, str]) -> dict[str, str]:
     signature = RequestValidator(AUTH_TOKEN).compute_signature(WEBHOOK_URL, params)
     return {"X-Twilio-Signature": signature}
+
+
+def signed_headers_for(path: str, params: dict[str, str], query: str = "") -> dict[str, str]:
+    url = f"http://testserver{path}{query}"
+    signature = RequestValidator(AUTH_TOKEN).compute_signature(url, params)
+    return {"X-Twilio-Signature": signature}
+
+
+@pytest.fixture(autouse=True)
+def isolated_conversation_database(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(main_module, "twilio_adapter", TwilioAdapter(auth_token=AUTH_TOKEN))
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        replace(main_module.settings, local_database_path=str(tmp_path / "service.sqlite3")),
+    )
 
 
 def test_voice_start_returns_greeting_twiml(monkeypatch) -> None:
@@ -201,3 +219,115 @@ class MockTwilioAdapter:
         if self.error:
             raise self.error
         return self.call_sid
+
+
+def start_real_flow(call_sid: str) -> None:
+    params = {"CallSid": call_sid, "From": "+15550000000"}
+    response = client.post(
+        WEBHOOK_PATH,
+        data=params,
+        headers=signed_headers_for(WEBHOOK_PATH, params),
+    )
+    assert response.status_code == 200
+    assert "/webhooks/twilio/voice/readiness?turn=1" in response.text
+
+
+def submit_readiness(call_sid: str, answer: str, turn: int = 1):
+    path = "/webhooks/twilio/voice/readiness"
+    params = {"CallSid": call_sid, "SpeechResult": answer, "Confidence": "0.9"}
+    query = f"?turn={turn}"
+    return client.post(
+        path + query,
+        data=params,
+        headers=signed_headers_for(path, params, query),
+    )
+
+
+def submit_answer(call_sid: str, answer: str, turn: int):
+    path = "/webhooks/twilio/voice/answer"
+    params = {"CallSid": call_sid, "SpeechResult": answer, "Confidence": "0.9"}
+    query = f"?turn={turn}"
+    return client.post(
+        path + query,
+        data=params,
+        headers=signed_headers_for(path, params, query),
+    )
+
+
+def test_real_flow_start_and_readiness_return_gathered_orientation_question() -> None:
+    call_sid = "CA_REAL_FLOW_START"
+    start_real_flow(call_sid)
+
+    response = submit_readiness(call_sid, "yes")
+
+    assert response.status_code == 200
+    assert "Thank you. We will take this one question at a time." in response.text
+    assert "What day is it today?" in response.text
+    assert "/webhooks/twilio/voice/answer?turn=2" in response.text
+
+
+def test_real_flow_answer_progresses_to_next_question() -> None:
+    call_sid = "CA_REAL_FLOW_PROGRESS"
+    start_real_flow(call_sid)
+    assert submit_readiness(call_sid, "ready").status_code == 200
+
+    response = submit_answer(call_sid, "monday", 2)
+
+    assert response.status_code == 200
+    assert "What month is it?" in response.text
+    assert "What day is it today?" not in response.text
+
+
+def test_real_flow_stop_returns_terminal_twiml() -> None:
+    call_sid = "CA_REAL_FLOW_STOP"
+    start_real_flow(call_sid)
+    submit_readiness(call_sid, "yes")
+
+    response = submit_answer(call_sid, "stop", 2)
+
+    assert response.status_code == 200
+    assert "Understood. Thank you for your time. Goodbye." in response.text
+    assert "<Hangup" in response.text
+
+
+def test_real_flow_unscorable_repeats_once_then_terminates() -> None:
+    call_sid = "CA_REAL_FLOW_UNSCORABLE"
+    start_real_flow(call_sid)
+    submit_readiness(call_sid, "yes")
+
+    retry = submit_answer(call_sid, "unclear", 2)
+    terminal = submit_answer(call_sid, "", 3)
+
+    assert retry.status_code == 200
+    assert "try once more" in retry.text
+    assert "/webhooks/twilio/voice/answer?turn=3" in retry.text
+    assert terminal.status_code == 200
+    assert "end the call now" in terminal.text
+    assert "<Hangup" in terminal.text
+
+
+def test_real_flow_three_incorrect_answers_terminate() -> None:
+    call_sid = "CA_REAL_FLOW_INCORRECT"
+    start_real_flow(call_sid)
+    submit_readiness(call_sid, "yes")
+
+    assert submit_answer(call_sid, "wrong", 2).status_code == 200
+    assert submit_answer(call_sid, "wrong", 3).status_code == 200
+    terminal = submit_answer(call_sid, "wrong", 4)
+
+    assert terminal.status_code == 200
+    assert "It seems like this is not a good time" in terminal.text
+    assert "<Hangup" in terminal.text
+
+
+def test_duplicate_webhook_replays_response_without_advancing_state() -> None:
+    call_sid = "CA_REAL_FLOW_DUPLICATE"
+    start_real_flow(call_sid)
+    first = submit_readiness(call_sid, "yes")
+    duplicate = submit_readiness(call_sid, "yes")
+
+    assert first.status_code == duplicate.status_code == 200
+    assert first.content == duplicate.content
+    next_question = submit_answer(call_sid, "monday", 2)
+    assert next_question.status_code == 200
+    assert "What month is it?" in next_question.text

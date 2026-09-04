@@ -12,6 +12,11 @@ from app.telephony.base import TelephonyAdapter
 class TwilioAdapter(TelephonyAdapter):
     """Build and validate the deterministic Twilio voice interaction."""
 
+    GREETING = (
+        "Hello, this is your memory assistance companion. "
+        "Take your time, and I will be here to help."
+    )
+
     def __init__(
         self,
         account_sid: str = "",
@@ -35,13 +40,43 @@ class TwilioAdapter(TelephonyAdapter):
 
     def greeting_response(self) -> str:
         response = VoiceResponse()
-        response.say(
-            "Hello, this is your memory assistance companion. "
-            "Take your time, and I will be here to help.",
-            voice="alice",
-            language="en-US",
-        )
+        self._say(response, self.GREETING)
         return str(response)
+
+    def gather_response(self, messages: tuple[str, ...], action_url: str) -> str:
+        response = VoiceResponse()
+        gather = response.gather(
+            input="speech",
+            action=action_url,
+            method="POST",
+            speech_timeout="auto",
+        )
+        for message in messages:
+            self._say(gather, message)
+        return str(response)
+
+    def greeting_gather_response(self, message: str, action_url: str) -> str:
+        self.greeting_response()
+        response = VoiceResponse()
+        self._say(response, self.GREETING)
+        gather = response.gather(
+            input="speech",
+            action=action_url,
+            method="POST",
+            speech_timeout="auto",
+        )
+        self._say(gather, message)
+        return str(response)
+
+    def terminal_response(self, messages: tuple[str, ...]) -> str:
+        response = VoiceResponse()
+        for message in messages:
+            self._say(response, message)
+        response.hangup()
+        return str(response)
+
+    def _say(self, response: VoiceResponse, message: str) -> None:
+        response.say(message, voice="alice", language="en-US")
 
     def start_outbound_call(self, to_phone_number: str, voice_url: str) -> str:
         if not self._client or not self._from_phone_number:

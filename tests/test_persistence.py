@@ -6,6 +6,7 @@ from app.mock_call import AnswerClassification, run_mock_call
 from app.persistence import (
     CallPersistenceRepository,
     CallQuestion,
+    ConversationRecord,
     CognitiveSession,
     LocalCallStore,
     PersistenceError,
@@ -40,6 +41,20 @@ class RepositorySpy:
     def persist_call(self, *args, **kwargs):
         self.persist_calls += 1
         return self.backend.persist_call(*args, **kwargs)
+
+    def get_conversation_state(self, session_id: str):
+        return self.backend.get_conversation_state(session_id)
+
+    def get_event_response(self, session_id: str, event_key: str):
+        return self.backend.get_event_response(session_id, event_key)
+
+    def save_conversation_state(
+        self,
+        record: ConversationRecord,
+        event_key: str,
+        response_body: str,
+    ) -> None:
+        self.backend.save_conversation_state(record, event_key, response_body)
 
 
 def run_with_store(responses: list[str | None], session_id: str):

@@ -82,6 +82,12 @@ class MockCallResult:
     persisted_call: PersistedCall | None = None
 
 
+@dataclass(frozen=True)
+class ConversationTurn:
+    messages: tuple[str, ...]
+    classification: AnswerClassification | None = None
+
+
 @dataclass
 class _ConversationProgress:
     state: ConversationState = ConversationState.GREETING
@@ -89,6 +95,235 @@ class _ConversationProgress:
     questions_completed: int = 0
     consecutive_incorrect: int = 0
     repeated_unscorable: bool = False
+
+
+class ConversationEngine:
+    """Incremental deterministic state machine shared by mock and Twilio flows."""
+
+    def __init__(
+        self,
+        session_id: str,
+        questions: tuple[MockQuestion, ...] = QUESTIONS,
+    ) -> None:
+        if len(questions) < 5:
+            raise ValueError("The prototype requires at least five question fixtures.")
+        self.session_id = session_id
+        self.question_set = questions[:5]
+        self.progress = _ConversationProgress()
+        self.question_order = list(range(5))
+        self.classifications: list[AnswerClassification] = []
+        self.question_attempts: list[MockQuestionAttempt] = []
+        self.attempt_counts: dict[int, int] = {}
+        self.readiness_attempts = 0
+        self.readiness = ReadinessOutcome.NO_INPUT
+        self.revision = 0
+
+    @property
+    def state(self) -> ConversationState:
+        return self.progress.state
+
+    @property
+    def current_question(self) -> MockQuestion | None:
+        if self.progress.question_position >= len(self.question_order):
+            return None
+        return self.question_set[self.question_order[self.progress.question_position]]
+
+    def start(self) -> ConversationTurn:
+        self.progress.state = ConversationState.READINESS
+        self.revision += 1
+        return ConversationTurn(("Are you ready to begin? Please say yes or no.",))
+
+    def submit_readiness(self, answer: str | None) -> ConversationTurn:
+        self.revision += 1
+        self.readiness_attempts += 1
+        self.readiness = classify_readiness(answer)
+        if self.readiness in {ReadinessOutcome.UNKNOWN, ReadinessOutcome.NO_INPUT}:
+            if self.readiness_attempts == 1:
+                return ConversationTurn(("I did not catch that. Please say ready or not ready.",))
+            return self._stop(("That is okay. We can try again another time. Goodbye.",))
+        if self.readiness is not ReadinessOutcome.READY:
+            return self._stop(("That is okay. We can try again another time. Goodbye.",))
+        self.progress.state = ConversationState.QUESTIONS
+        return ConversationTurn(
+            (
+                "Thank you. We will take this one question at a time.",
+                self.current_question.prompt,
+            )
+        )
+
+    def submit_answer(
+        self,
+        answer: str | None | MockSpeechResult,
+    ) -> ConversationTurn:
+        self.revision += 1
+        question = self.current_question
+        if self.progress.state is not ConversationState.QUESTIONS or question is None:
+            return ConversationTurn(())
+        if isinstance(answer, MockSpeechResult):
+            response = answer.text
+            confidence = answer.confidence
+        else:
+            response = answer
+            confidence = None
+        classification = classify_answer(response, question, confidence)
+        question_index = self.question_order[self.progress.question_position]
+        self.attempt_counts[question_index] = self.attempt_counts.get(question_index, 0) + 1
+        self.question_attempts.append(
+            MockQuestionAttempt(
+                question_number=question_index + 1,
+                attempt_number=self.attempt_counts[question_index],
+                prompt=question.prompt,
+                response=response,
+                classification=classification,
+                difficulty=question.difficulty,
+            )
+        )
+        self.classifications.append(classification)
+
+        if classification is AnswerClassification.STOP:
+            return self._stop(("Understood. Thank you for your time. Goodbye.",), classification)
+        if classification is AnswerClassification.UNSCORABLE:
+            if not self.progress.repeated_unscorable:
+                self.progress.repeated_unscorable = True
+                return ConversationTurn(
+                    ("I did not catch that. Please take your time and try once more.",),
+                    classification,
+                )
+            return self._stop(
+                ("I am having trouble hearing you. We will end the call now. Goodbye.",),
+                classification,
+            )
+        if classification is AnswerClassification.SKIPPED:
+            self.progress.question_position += 1
+            self.progress.repeated_unscorable = False
+            return self._next_question(("That is okay. We will move to the next question.",), classification)
+
+        self.progress.repeated_unscorable = False
+        if classification is AnswerClassification.CORRECT:
+            self.progress.questions_completed += 1
+            self.progress.consecutive_incorrect = 0
+            self.progress.question_position += 1
+            return self._next_question((), classification)
+
+        self.progress.consecutive_incorrect += 1
+        if self.progress.consecutive_incorrect >= 3:
+            return self._stop(
+                ("It seems like this is not a good time. We will end the call now. Goodbye.",),
+                classification,
+            )
+        if self.progress.consecutive_incorrect == 2:
+            remaining = self.question_order[self.progress.question_position + 1 :]
+            remaining.sort(key=lambda index: self.question_set[index].difficulty)
+            self.question_order[self.progress.question_position + 1 :] = remaining
+            message = "That is okay. I will make the next question a little easier."
+        else:
+            message = "That is okay. We will keep going one step at a time."
+        self.progress.question_position += 1
+        return self._next_question((message,), classification)
+
+    def build_result(self, transcript: tuple[str, ...]) -> MockCallResult:
+        status = "COMPLETED" if self.state is ConversationState.COMPLETED else "STOPPED"
+        return MockCallResult(
+            status,
+            self.state,
+            self.readiness,
+            tuple(self.classifications),
+            self.progress.questions_completed,
+            self.progress.consecutive_incorrect,
+            transcript,
+            self.session_id,
+            tuple(self.question_attempts),
+        )
+
+    def to_state(self) -> dict[str, object]:
+        """Return JSON-compatible state for server-side conversation storage."""
+
+        return {
+            "progress": {
+                "state": self.progress.state.value,
+                "question_position": self.progress.question_position,
+                "questions_completed": self.progress.questions_completed,
+                "consecutive_incorrect": self.progress.consecutive_incorrect,
+                "repeated_unscorable": self.progress.repeated_unscorable,
+            },
+            "question_order": self.question_order,
+            "classifications": [classification.value for classification in self.classifications],
+            "question_attempts": [
+                {
+                    "question_number": attempt.question_number,
+                    "attempt_number": attempt.attempt_number,
+                    "prompt": attempt.prompt,
+                    "response": attempt.response,
+                    "classification": attempt.classification.value,
+                    "difficulty": attempt.difficulty,
+                }
+                for attempt in self.question_attempts
+            ],
+            "attempt_counts": self.attempt_counts,
+            "readiness_attempts": self.readiness_attempts,
+            "readiness": self.readiness.value,
+            "revision": self.revision,
+        }
+
+    @classmethod
+    def from_state(
+        cls,
+        session_id: str,
+        state: dict[str, object],
+        questions: tuple[MockQuestion, ...] = QUESTIONS,
+    ) -> "ConversationEngine":
+        engine = cls(session_id, questions)
+        progress = state["progress"]
+        engine.progress = _ConversationProgress(
+            state=ConversationState(progress["state"]),
+            question_position=progress["question_position"],
+            questions_completed=progress["questions_completed"],
+            consecutive_incorrect=progress["consecutive_incorrect"],
+            repeated_unscorable=progress["repeated_unscorable"],
+        )
+        engine.question_order = state["question_order"]
+        engine.classifications = [
+            AnswerClassification(value) for value in state["classifications"]
+        ]
+        engine.question_attempts = [
+            MockQuestionAttempt(
+                question_number=attempt["question_number"],
+                attempt_number=attempt["attempt_number"],
+                prompt=attempt["prompt"],
+                response=attempt["response"],
+                classification=AnswerClassification(attempt["classification"]),
+                difficulty=attempt["difficulty"],
+            )
+            for attempt in state["question_attempts"]
+        ]
+        engine.attempt_counts = {int(key): value for key, value in state["attempt_counts"].items()}
+        engine.readiness_attempts = state["readiness_attempts"]
+        engine.readiness = ReadinessOutcome(state["readiness"])
+        engine.revision = state["revision"]
+        return engine
+
+    def _next_question(
+        self,
+        messages: tuple[str, ...],
+        classification: AnswerClassification,
+    ) -> ConversationTurn:
+        question = self.current_question
+        if question is None:
+            self.progress.state = ConversationState.COMPLETED
+            return ConversationTurn(
+                messages
+                + ("You have completed all five questions. Thank you for taking part. Goodbye.",),
+                classification,
+            )
+        return ConversationTurn(messages + (question.prompt,), classification)
+
+    def _stop(
+        self,
+        messages: tuple[str, ...],
+        classification: AnswerClassification | None = None,
+    ) -> ConversationTurn:
+        self.progress.state = ConversationState.STOPPED
+        return ConversationTurn(messages, classification)
 
 
 def classify_answer(
@@ -142,52 +377,17 @@ def run_mock_call(
 ) -> MockCallResult:
     """Run one complete deterministic mock call and return its session result."""
 
-    if len(questions) < 5:
-        raise ValueError("The prototype requires at least five question fixtures.")
-    question_set = questions[:5]
-
     if store is not None and session_id is not None:
         existing_result = store.get_result(session_id)
         if existing_result is not None:
             return existing_result
 
     adapter = MockTelephonyAdapter(responses)
-    classifications: list[AnswerClassification] = []
-    question_attempts: list[MockQuestionAttempt] = []
-    attempt_counts: dict[int, int] = {}
     call_session_id = session_id or str(uuid4())
-    progress = _ConversationProgress()
+    engine = ConversationEngine(call_session_id, questions)
 
-    def record_attempt(
-        question_index: int,
-        question: MockQuestion,
-        response: str | None,
-        classification: AnswerClassification,
-    ) -> None:
-        attempt_counts[question_index] = attempt_counts.get(question_index, 0) + 1
-        question_attempts.append(
-            MockQuestionAttempt(
-                question_number=question_index + 1,
-                attempt_number=attempt_counts[question_index],
-                prompt=question.prompt,
-                response=response,
-                classification=classification,
-                difficulty=question.difficulty,
-            )
-        )
-
-    def finish(status: str, readiness_outcome: ReadinessOutcome) -> MockCallResult:
-        result = MockCallResult(
-            status,
-            progress.state,
-            readiness_outcome,
-            tuple(classifications),
-            progress.questions_completed,
-            progress.consecutive_incorrect,
-            tuple(adapter.transcript),
-            call_session_id,
-            tuple(question_attempts),
-        )
+    def finish() -> MockCallResult:
+        result = engine.build_result(tuple(adapter.transcript))
         from app.persistence import create_local_repository
 
         persisted = (store or create_local_repository()).persist_call(
@@ -200,79 +400,15 @@ def run_mock_call(
 
     adapter.start_call()
     adapter.speak(adapter.greeting_response())
-    progress.state = ConversationState.READINESS
-    adapter.speak("Are you ready to begin? Please say yes or no.")
-    readiness = adapter.listen()
-    readiness_outcome = classify_readiness(readiness)
-    if readiness_outcome in {ReadinessOutcome.UNKNOWN, ReadinessOutcome.NO_INPUT}:
-        adapter.speak("I did not catch that. Please say ready or not ready.")
-        readiness_outcome = classify_readiness(adapter.listen())
-    if readiness_outcome is not ReadinessOutcome.READY:
-        progress.state = ConversationState.STOPPED
-        adapter.speak("That is okay. We can try again another time. Goodbye.")
-        return finish("STOPPED", readiness_outcome)
-
-    adapter.speak("Thank you. We will take this one question at a time.")
-    progress.state = ConversationState.QUESTIONS
-    question_order = list(range(5))
-
-    while progress.question_position < len(question_order):
-        question_index = question_order[progress.question_position]
-        question = question_set[question_index]
-        adapter.speak(question.prompt)
-        raw_response = adapter.listen()
-        if isinstance(raw_response, MockSpeechResult):
-            response = raw_response.text
-            confidence = raw_response.confidence
-        else:
-            response = raw_response
-            confidence = None
-        classification = classify_answer(response, question, confidence)
-        record_attempt(question_index, question, response, classification)
-
-        if classification is AnswerClassification.STOP:
-            classifications.append(classification)
-            progress.state = ConversationState.STOPPED
-            adapter.speak("Understood. Thank you for your time. Goodbye.")
-            return finish("STOPPED", readiness_outcome)
-        if classification is AnswerClassification.UNSCORABLE:
-            classifications.append(classification)
-            if not progress.repeated_unscorable:
-                progress.repeated_unscorable = True
-                adapter.speak("I did not catch that. Please take your time and try once more.")
-                continue
-            progress.state = ConversationState.STOPPED
-            adapter.speak("I am having trouble hearing you. We will end the call now. Goodbye.")
-            return finish("STOPPED", readiness_outcome)
-        if classification is AnswerClassification.SKIPPED:
-            classifications.append(classification)
-            adapter.speak("That is okay. We will move to the next question.")
-            progress.question_position += 1
-            progress.repeated_unscorable = False
-            continue
-
-        classifications.append(classification)
-        progress.repeated_unscorable = False
-        if classification is AnswerClassification.CORRECT:
-            progress.questions_completed += 1
-            progress.consecutive_incorrect = 0
-            progress.question_position += 1
-            continue
-
-        progress.consecutive_incorrect += 1
-        if progress.consecutive_incorrect == 1:
-            adapter.speak("That is okay. We will keep going one step at a time.")
-        if progress.consecutive_incorrect >= 3:
-            progress.state = ConversationState.STOPPED
-            adapter.speak("It seems like this is not a good time. We will end the call now. Goodbye.")
-            return finish("STOPPED", readiness_outcome)
-        if progress.consecutive_incorrect == 2:
-            adapter.speak("That is okay. I will make the next question a little easier.")
-            remaining = question_order[progress.question_position + 1 :]
-            remaining.sort(key=lambda index: question_set[index].difficulty)
-            question_order[progress.question_position + 1 :] = remaining
-        progress.question_position += 1
-
-    progress.state = ConversationState.COMPLETED
-    adapter.speak("You have completed all five questions. Thank you for taking part. Goodbye.")
-    return finish("COMPLETED", readiness_outcome)
+    for message in engine.start().messages:
+        adapter.speak(message)
+    while engine.state is ConversationState.READINESS:
+        readiness = adapter.listen()
+        for message in engine.submit_readiness(readiness).messages:
+            adapter.speak(message)
+    while engine.state is ConversationState.QUESTIONS:
+        answer = adapter.listen()
+        turn = engine.submit_answer(answer)
+        for message in turn.messages:
+            adapter.speak(message)
+    return finish()
