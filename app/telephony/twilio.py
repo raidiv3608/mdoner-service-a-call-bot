@@ -24,6 +24,7 @@ class TwilioAdapter(TelephonyAdapter):
         from_phone_number: str = "",
     ) -> None:
         self._account_sid = account_sid
+        self._auth_token = auth_token
         self._from_phone_number = from_phone_number
         self._client = Client(account_sid, auth_token) if account_sid and auth_token else None
         self._validator = RequestValidator(auth_token)
@@ -34,7 +35,8 @@ class TwilioAdapter(TelephonyAdapter):
         params: Mapping[str, str],
         signature: str | None,
     ) -> bool:
-        if not signature:
+        # Security: Fail closed if signature is missing or auth token is not configured
+        if not signature or not self._auth_token:
             return False
         return bool(self._validator.validate(url, dict(params), signature))
 

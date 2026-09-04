@@ -90,6 +90,17 @@ def test_voice_start_rejects_missing_signature() -> None:
     assert response.status_code == 403
 
 
+def test_voice_start_rejects_unconfigured_auth_token(monkeypatch) -> None:
+    monkeypatch.setattr(main_module, "twilio_adapter", TwilioAdapter(auth_token=""))
+    response = client.post(
+        "/webhooks/twilio/voice/start",
+        data={"CallSid": "CA123"},
+        headers={"X-Twilio-Signature": "some-signature"},
+    )
+
+    assert response.status_code == 403
+
+
 def test_voice_start_rejects_invalid_signature() -> None:
     response = client.post(
         "/webhooks/twilio/voice/start",
