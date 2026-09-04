@@ -118,3 +118,86 @@ def test_provider_failure_returns_safe_error(monkeypatch) -> None:
     )
 
     assert response.status_code == 502
+
+
+def test_trigger_outbound_call_returns_call_sid(monkeypatch) -> None:
+    adapter = MockTwilioAdapter(call_sid="CA_TRIGGERED")
+    monkeypatch.setattr(main_module, "twilio_adapter", adapter)
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        replace(main_module.settings, twilio_public_base_url="https://service.example.com"),
+    )
+
+    response = client.post(
+        "/v1/calls/trigger",
+        json={"to_phone_number": "+15551234567"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"call_sid": "CA_TRIGGERED"}
+
+
+def test_trigger_rejects_invalid_phone_number(monkeypatch) -> None:
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        replace(main_module.settings, twilio_public_base_url="https://service.example.com"),
+    )
+
+    response = client.post(
+        "/v1/calls/trigger",
+        json={"to_phone_number": "555-123-4567"},
+    )
+
+    assert response.status_code == 422
+
+
+def test_trigger_returns_safe_error_on_provider_failure(monkeypatch) -> None:
+    adapter = MockTwilioAdapter(error=RuntimeError("provider unavailable"))
+    monkeypatch.setattr(main_module, "twilio_adapter", adapter)
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        replace(main_module.settings, twilio_public_base_url="https://service.example.com"),
+    )
+
+    response = client.post(
+        "/v1/calls/trigger",
+        json={"to_phone_number": "+15551234567"},
+    )
+
+    assert response.status_code == 502
+
+
+def test_trigger_builds_exact_voice_webhook_url(monkeypatch) -> None:
+    adapter = MockTwilioAdapter(call_sid="CA_URL_CHECK")
+    monkeypatch.setattr(main_module, "twilio_adapter", adapter)
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        replace(main_module.settings, twilio_public_base_url="https://service.example.com/"),
+    )
+
+    response = client.post(
+        "/v1/calls/trigger",
+        json={"to_phone_number": "+447700900123"},
+    )
+
+    assert response.status_code == 200
+    assert adapter.calls == [
+        ("+447700900123", "https://service.example.com/webhooks/twilio/voice/start")
+    ]
+
+
+class MockTwilioAdapter:
+    def __init__(self, call_sid: str = "CA_MOCK", error: Exception | None = None) -> None:
+        self.call_sid = call_sid
+        self.error = error
+        self.calls: list[tuple[str, str]] = []
+
+    def start_outbound_call(self, to_phone_number: str, voice_url: str) -> str:
+        self.calls.append((to_phone_number, voice_url))
+        if self.error:
+            raise self.error
+        return self.call_sid

@@ -2,6 +2,7 @@
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
+from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.telephony.twilio import TwilioAdapter
@@ -9,6 +10,13 @@ from app.telephony.twilio import TwilioAdapter
 
 app = FastAPI(title=settings.app_name)
 TWILIO_VOICE_START_PATH = "/webhooks/twilio/voice/start"
+E164_PATTERN = r"^\+[1-9]\d{7,14}$"
+
+
+class CallTriggerRequest(BaseModel):
+    to_phone_number: str = Field(pattern=E164_PATTERN)
+
+
 twilio_adapter = TwilioAdapter(
     account_sid=settings.twilio_account_sid,
     auth_token=settings.twilio_auth_token,
@@ -21,6 +29,23 @@ def health_check() -> dict[str, str]:
     """Report whether the application process is available."""
 
     return {"status": "ok", "service": settings.app_name}
+
+
+@app.post("/v1/calls/trigger")
+def trigger_outbound_call(request: CallTriggerRequest) -> dict[str, str]:
+    """Start one developer-triggered outbound call."""
+
+    if not settings.twilio_public_base_url:
+        raise HTTPException(status_code=500, detail="Twilio public base URL is not configured")
+    voice_url = f"{settings.twilio_public_base_url.rstrip('/')}{TWILIO_VOICE_START_PATH}"
+    try:
+        call_sid = twilio_adapter.start_outbound_call(
+            request.to_phone_number,
+            voice_url,
+        )
+    except Exception as error:
+        raise HTTPException(status_code=502, detail="Telephony provider unavailable") from error
+    return {"call_sid": call_sid}
 
 
 @app.post("/webhooks/twilio/voice/start", response_class=Response)
