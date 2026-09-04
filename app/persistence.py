@@ -509,11 +509,73 @@ class LocalCallStore:
         return PersistedCall(session, questions, metrics)
 
     def count(self, table_name: str) -> int:
-        if table_name not in {"cognitive_sessions", "call_questions", "session_metrics"}:
+        if table_name not in {
+            "cognitive_sessions",
+            "call_questions",
+            "session_metrics",
+            "conversation_states",
+            "conversation_events",
+            "conversation_event_claims",
+        }:
             raise ValueError("Unsupported persistence table")
         return self.connection.execute(
             f"SELECT COUNT(*) FROM {table_name}"
         ).fetchone()[0]
+
+    def purge_expired_records(self, older_than: datetime) -> dict[str, int]:
+        """Delete session records and transient state older than specified datetime."""
+
+        cutoff_iso = older_than.isoformat()
+        try:
+            with self.connection:
+                session_rows = self.connection.execute(
+                    "SELECT session_id FROM cognitive_sessions WHERE started_at < ?",
+                    (cutoff_iso,),
+                ).fetchall()
+                expired_session_ids = [row[0] for row in session_rows]
+
+                deleted_metrics = 0
+                deleted_questions = 0
+                deleted_sessions = 0
+
+                if expired_session_ids:
+                    placeholders = ",".join("?" for _ in expired_session_ids)
+                    deleted_metrics = self.connection.execute(
+                        f"DELETE FROM session_metrics WHERE session_id IN ({placeholders})",
+                        tuple(expired_session_ids),
+                    ).rowcount
+                    deleted_questions = self.connection.execute(
+                        f"DELETE FROM call_questions WHERE session_id IN ({placeholders})",
+                        tuple(expired_session_ids),
+                    ).rowcount
+                    deleted_sessions = self.connection.execute(
+                        f"DELETE FROM cognitive_sessions WHERE session_id IN ({placeholders})",
+                        tuple(expired_session_ids),
+                    ).rowcount
+                    self.connection.execute(
+                        f"DELETE FROM conversation_states WHERE session_id IN ({placeholders})",
+                        tuple(expired_session_ids),
+                    )
+                    self.connection.execute(
+                        f"DELETE FROM conversation_events WHERE session_id IN ({placeholders})",
+                        tuple(expired_session_ids),
+                    )
+                    self.connection.execute(
+                        f"DELETE FROM conversation_event_claims WHERE session_id IN ({placeholders})",
+                        tuple(expired_session_ids),
+                    )
+
+                for session_id in expired_session_ids:
+                    self._persisted_cache.pop(session_id, None)
+                    self._result_cache.pop(session_id, None)
+
+                return {
+                    "cognitive_sessions": deleted_sessions,
+                    "call_questions": deleted_questions,
+                    "session_metrics": deleted_metrics,
+                }
+        except sqlite3.Error as error:
+            raise PersistenceError("Data retention purge failed") from error
 
 
 def create_local_repository(database_path: str = ":memory:") -> CallPersistenceRepository:
