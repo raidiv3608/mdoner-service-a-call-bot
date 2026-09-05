@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import logging
 import time
+from contextlib import asynccontextmanager
 from collections import defaultdict, deque
 
 from fastapi import FastAPI, HTTPException, Request
@@ -21,7 +22,21 @@ from app.telephony.twilio import TwilioAdapter
 
 logger = logging.getLogger("app.main")
 
-app = FastAPI(title=settings.app_name)
+
+def validate_startup_configuration() -> None:
+    """Reject startup when the developer trigger cannot be authenticated."""
+
+    if not settings.trigger_auth_token or not settings.trigger_auth_token.strip():
+        raise RuntimeError("SERVICE_A_TRIGGER_AUTH_TOKEN must be configured")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    validate_startup_configuration()
+    yield
+
+
+app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -164,9 +179,20 @@ def _turn_value(request: Request) -> int:
     if raw_turn is None:
         raise HTTPException(status_code=400, detail="Conversation turn is required")
     try:
-        return int(raw_turn)
+        turn = int(raw_turn)
     except ValueError as error:
         raise HTTPException(status_code=400, detail="Invalid conversation turn") from error
+    max_turn = question_planner.max_questions + 1
+    if not 1 <= turn <= max_turn:
+        raise HTTPException(status_code=400, detail="Invalid conversation turn")
+    return turn
+
+
+def _webhook_event_key(event_type: str, turn: int, params: dict[str, str]) -> str:
+    speech = " ".join(params.get("SpeechResult", "").split()).casefold()
+    confidence = params.get("Confidence", "").strip()
+    event_digest = hashlib.sha256(f"{speech}\0{confidence}".encode()).hexdigest()
+    return f"{event_type}:{turn}:{event_digest}"
 
 
 def _speech_input(params: dict[str, str]) -> str | MockSpeechResult | None:
@@ -302,7 +328,7 @@ async def twilio_voice_readiness(request: Request) -> Response:
     params = await _validated_params(request, TWILIO_READINESS_PATH)
     turn_number = _turn_value(request)
     repository = _repository()
-    event_key = f"readiness:{turn_number}:{params.get('SpeechResult', '')}:{params.get('Confidence', '')}"
+    event_key = _webhook_event_key("readiness", turn_number, params)
     existing = repository.get_event_response(params["CallSid"], event_key)
     if existing is not None:
         return Response(content=existing, media_type="application/xml")
@@ -330,7 +356,7 @@ async def twilio_voice_answer(request: Request) -> Response:
     params = await _validated_params(request, TWILIO_ANSWER_PATH)
     turn_number = _turn_value(request)
     repository = _repository()
-    event_key = f"answer:{turn_number}:{params.get('SpeechResult', '')}:{params.get('Confidence', '')}"
+    event_key = _webhook_event_key("answer", turn_number, params)
     existing = repository.get_event_response(params["CallSid"], event_key)
     if existing is not None:
         return Response(content=existing, media_type="application/xml")

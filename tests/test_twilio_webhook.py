@@ -130,6 +130,49 @@ def test_duplicate_webhook_returns_same_greeting_without_new_state(monkeypatch) 
     assert first.content == second.content
 
 
+def test_equivalent_speech_webhooks_are_idempotent() -> None:
+    call_sid = "CA_EQUIVALENT_SPEECH"
+    start_real_flow(call_sid)
+    path = "/webhooks/twilio/voice/readiness"
+    query = "?turn=1"
+    first_params = {"CallSid": call_sid, "SpeechResult": "yes", "Confidence": "0.9"}
+    equivalent_params = {
+        "CallSid": call_sid,
+        "SpeechResult": "  YES  ",
+        "Confidence": "0.9",
+    }
+
+    first = client.post(
+        path + query,
+        data=first_params,
+        headers=signed_headers_for(path, first_params, query),
+    )
+    second = client.post(
+        path + query,
+        data=equivalent_params,
+        headers=signed_headers_for(path, equivalent_params, query),
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert first.content == second.content
+
+
+@pytest.mark.parametrize("turn", [0, -1, 10, 999])
+def test_webhook_rejects_invalid_turn_values(turn: int) -> None:
+    path = "/webhooks/twilio/voice/readiness"
+    params = {"CallSid": f"CA_INVALID_TURN_{turn}"}
+    query = f"?turn={turn}"
+
+    response = client.post(
+        path + query,
+        data=params,
+        headers=signed_headers_for(path, params, query),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid conversation turn"
+
+
 def test_malformed_webhook_input_returns_safe_error() -> None:
     response = client.post(WEBHOOK_PATH, data={"From": "+15550000000"})
 
@@ -291,6 +334,32 @@ class MockTwilioAdapter:
         if self.error:
             raise self.error
         return self.call_sid
+
+
+def test_twilio_adapter_configures_outbound_request_timeout(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class DummyHttpClient:
+        def __init__(self, **kwargs) -> None:
+            captured["http_timeout"] = kwargs["timeout"]
+
+    class DummyClient:
+        def __init__(self, account_sid, auth_token, **kwargs) -> None:
+            captured["account_sid"] = account_sid
+            captured["auth_token"] = auth_token
+            captured["http_client"] = kwargs["http_client"]
+
+    monkeypatch.setattr("app.telephony.twilio.TwilioHttpClient", DummyHttpClient)
+    monkeypatch.setattr("app.telephony.twilio.Client", DummyClient)
+
+    TwilioAdapter(
+        account_sid="AC123",
+        auth_token=AUTH_TOKEN,
+        from_phone_number="+15550000000",
+    )
+
+    assert captured["http_timeout"] == 10
+    assert isinstance(captured["http_client"], DummyHttpClient)
 
 
 def start_real_flow(call_sid: str) -> None:

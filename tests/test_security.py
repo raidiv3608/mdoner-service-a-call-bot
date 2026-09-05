@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
 import importlib
+from dataclasses import replace
 
+import pytest
 from fastapi.testclient import TestClient
 from twilio.request_validator import RequestValidator
 
@@ -15,6 +17,18 @@ AUTH_TOKEN = "test-auth-token"
 
 def test_trigger_outbound_call_rate_limiting(monkeypatch) -> None:
     trigger_rate_limiter.reset()
+
+
+def test_startup_rejects_missing_trigger_auth_token(monkeypatch) -> None:
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        replace(main_module.settings, trigger_auth_token="  "),
+    )
+
+    with pytest.raises(RuntimeError, match="SERVICE_A_TRIGGER_AUTH_TOKEN"):
+        with TestClient(app):
+            pass
     monkeypatch.setattr(
         main_module,
         "settings",

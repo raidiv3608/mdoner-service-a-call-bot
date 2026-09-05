@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 
+from twilio.http.http_client import TwilioHttpClient
 from twilio.rest import Client
 from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import VoiceResponse
@@ -11,6 +12,8 @@ from app.telephony.base import TelephonyAdapter
 
 class TwilioAdapter(TelephonyAdapter):
     """Build and validate the deterministic Twilio voice interaction."""
+
+    OUTBOUND_REQUEST_TIMEOUT_SECONDS = 10
 
     GREETING = (
         "Hello, this is your memory assistance companion. "
@@ -26,7 +29,15 @@ class TwilioAdapter(TelephonyAdapter):
         self._account_sid = account_sid
         self._auth_token = auth_token
         self._from_phone_number = from_phone_number
-        self._client = Client(account_sid, auth_token) if account_sid and auth_token else None
+        self._client = (
+            Client(
+                account_sid,
+                auth_token,
+                http_client=TwilioHttpClient(timeout=self.OUTBOUND_REQUEST_TIMEOUT_SECONDS),
+            )
+            if account_sid and auth_token
+            else None
+        )
         self._validator = RequestValidator(auth_token)
 
     def validate_webhook(
